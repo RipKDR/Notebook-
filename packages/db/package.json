@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "node --experimental-sqlite ../../node_modules/vitest/vitest.mjs run",
     "clean": "rm -rf dist .turbo"
   },
   "dependencies": {

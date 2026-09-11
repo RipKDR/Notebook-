@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "Loom",
+    "slug": "loom",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "loom",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.loom.app"
+    },
+    "android": {
+      "package": "com.loom.app",
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-sqlite",
+        {
+          "enableFTS": true,
+          "withSQLiteVecExtension": true
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#FBF9F4",
+          "dark": { "backgroundColor": "#14120E" },
+          "resizeMode": "contain"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
