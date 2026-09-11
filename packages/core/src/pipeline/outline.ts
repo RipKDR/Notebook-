@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getForm } from "../forms/registry.js";
-import type { Llm } from "../llm/client.js";
+import type { LlmLike } from "../llm/interfaces.js";
 import { renderBible } from "../prompts/render.js";
 import type { Bible } from "../types/bible.js";
 import type { Fragment } from "../types/fragment.js";
@@ -120,7 +120,7 @@ const EXPAND_SYSTEM = [
 ].join("\n");
 
 export interface BuildOutlineOptions {
-  readonly llm: Llm;
+  readonly llm: LlmLike;
   readonly projectId: ProjectId;
   readonly bible: Bible;
   readonly fragments: readonly Fragment[];

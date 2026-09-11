@@ -46,7 +46,7 @@ apps/worker       Hono compile service. Holds the model credential.
 ```bash
 pnpm install
 pnpm build          # builds packages/core then packages/db
-pnpm test           # 150 tests
+pnpm test           # 167 tests
 pnpm typecheck
 ```
 

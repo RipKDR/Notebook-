@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getForm } from "../forms/registry.js";
-import type { Llm } from "../llm/client.js";
+import type { LlmLike } from "../llm/interfaces.js";
 import { renderBible } from "../prompts/render.js";
 import type { Bible, BibleEntity, FormBible, VoiceGuide } from "../types/bible.js";
 import { estimateTokens, type Fragment } from "../types/fragment.js";
@@ -99,7 +99,7 @@ const BASE_SYSTEM = [
 ].join("\n");
 
 export interface BuildBibleOptions {
-  readonly llm: Llm;
+  readonly llm: LlmLike;
   readonly projectId: ProjectId;
   readonly form: WorkForm;
   readonly fragments: readonly Fragment[];

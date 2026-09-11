@@ -42,8 +42,6 @@ const base = {
   card: card(),
   bibleVersion: 1,
   fragments: [fragment("f1", "She never once said my name.")],
-  prevTailHash: "tail",
-  ledgerHash: "ledger",
 };
 
 describe("sceneKey", () => {
@@ -74,8 +72,18 @@ describe("sceneKey", () => {
     );
   });
 
-  it("changes when the preceding scene's prose changes", () => {
-    expect(sceneKey({ ...base, prevTailHash: "different" })).not.toBe(sceneKey(base));
+  it("is stable across compiles, which is what makes rebuilds incremental", () => {
+    // Recomputed from the same inputs on a later run, the key must be identical.
+    // It previously folded in the previous scene's prose and the continuity
+    // ledger — both empty on a first compile and populated on the next — which
+    // changed every key on the second run and rebuilt the entire book.
+    const first = sceneKey(base);
+    const second = sceneKey({
+      card: card(),
+      bibleVersion: 1,
+      fragments: [fragment("f1", "She never once said my name.")],
+    });
+    expect(second).toBe(first);
   });
 
   it("ignores the scene card's index, which carries no drafting information", () => {
@@ -84,34 +92,36 @@ describe("sceneKey", () => {
 });
 
 describe("dirtyScenes", () => {
-  const order = ["a", "b", "c", "d"];
+  const ordered = (pairs: [string, string][]) => pairs.map(([id, key]) => ({ id, key }));
 
-  it("rebuilds nothing when every key matches", () => {
-    const keys = new Map([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]);
-    expect(dirtyScenes(keys, keys, order).size).toBe(0);
+  it("builds nothing when every key has already been built", () => {
+    const scenes = ordered([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]);
+    const built = new Set(["1", "2", "3", "4"]);
+    expect(dirtyScenes(scenes, built).size).toBe(0);
   });
 
   it("rebuilds a changed scene and cascades one forward", () => {
-    const prev = new Map([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]);
-    const now = new Map([["a", "1"], ["b", "CHANGED"], ["c", "3"], ["d", "4"]]);
-    expect([...dirtyScenes(now, prev, order)].sort()).toEqual(["b", "c"]);
+    const scenes = ordered([["a", "1"], ["b", "CHANGED"], ["c", "3"], ["d", "4"]]);
+    const built = new Set(["1", "2", "3", "4"]);
+    expect([...dirtyScenes(scenes, built)].sort()).toEqual(["b", "c"]);
   });
 
   it("rebuilds everything on a first compile", () => {
-    const now = new Map([["a", "1"], ["b", "2"]]);
-    expect(dirtyScenes(now, new Map(), ["a", "b"]).size).toBe(2);
+    const scenes = ordered([["a", "1"], ["b", "2"]]);
+    expect(dirtyScenes(scenes, new Set()).size).toBe(2);
   });
 
-  it("treats a new scene as dirty", () => {
-    const prev = new Map([["a", "1"]]);
-    const now = new Map([["a", "1"], ["b", "2"]]);
-    expect([...dirtyScenes(now, prev, ["a", "b"])]).toEqual(["b"]);
+  it("reuses prose under a new scene id when the content key matches", () => {
+    // A regenerated outline renames every scene. Matching on content rather than
+    // identity is what stops that rebuilding the whole book.
+    const renamed = ordered([["fresh-id-1", "1"], ["fresh-id-2", "2"]]);
+    expect(dirtyScenes(renamed, new Set(["1", "2"])).size).toBe(0);
   });
 
   it("honours a wider cascade limit", () => {
-    const prev = new Map([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]);
-    const now = new Map([["a", "CHANGED"], ["b", "2"], ["c", "3"], ["d", "4"]]);
-    expect([...dirtyScenes(now, prev, order, 2)].sort()).toEqual(["a", "b", "c"]);
+    const scenes = ordered([["a", "CHANGED"], ["b", "2"], ["c", "3"], ["d", "4"]]);
+    const built = new Set(["1", "2", "3", "4"]);
+    expect([...dirtyScenes(scenes, built, 2)].sort()).toEqual(["a", "b", "c"]);
   });
 });
 

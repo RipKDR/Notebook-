@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Llm } from "../llm/client.js";
+import type { LlmLike } from "../llm/interfaces.js";
 import type { EmbeddingProvider } from "../retrieval/embed.js";
 import { FRAGMENT_KINDS, type Fragment, type FragmentEnrichment } from "../types/fragment.js";
 import { asEntityId, type FragmentId } from "../types/ids.js";
@@ -82,7 +82,7 @@ const SYSTEM = [
 ].join("\n");
 
 export interface EnrichOptions {
-  readonly llm: Llm;
+  readonly llm: LlmLike;
   readonly embeddings: EmbeddingProvider;
   readonly onProgress?: (done: number, total: number) => void;
   readonly signal?: AbortSignal;

@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { BatchRequest, BatchRunner } from "../llm/batch.js";
-import type { Llm } from "../llm/client.js";
+import type { BatchRequest } from "../llm/batch.js";
+import type { BatchLike, LlmLike } from "../llm/interfaces.js";
+
 import type { CostBudget } from "../llm/models.js";
 import { renderBible } from "../prompts/render.js";
 import type { Bible } from "../types/bible.js";
@@ -57,7 +58,7 @@ const SEAM_WORDS = 180;
 export async function smoothTransitions(
   scenes: readonly DraftedScene[],
   ctx: ReviseContext,
-  batch: BatchRunner,
+  batch: BatchLike,
   opts: { budget?: CostBudget; onProgress?: (d: number, t: number) => void; signal?: AbortSignal } = {},
 ): Promise<DraftedScene[]> {
   if (scenes.length < 2) return [...scenes];
@@ -153,7 +154,7 @@ const AUDIT_SYSTEM = [
 export async function auditContinuity(
   scenes: readonly DraftedScene[],
   ctx: ReviseContext,
-  llm: Llm,
+  llm: LlmLike,
 ): Promise<{ issues: ContinuityIssue[]; assessment: string }> {
   const cards = allScenes(ctx.outline);
   const cardById = new Map(cards.map((c) => [c.id as string, c]));
@@ -200,7 +201,7 @@ export async function applyContinuityFixes(
   scenes: readonly DraftedScene[],
   issues: readonly ContinuityIssue[],
   ctx: ReviseContext,
-  batch: BatchRunner,
+  batch: BatchLike,
   opts: { budget?: CostBudget; signal?: AbortSignal; minSeverity?: "breaking" | "noticeable" | "minor" } = {},
 ): Promise<DraftedScene[]> {
   const rank = { breaking: 3, noticeable: 2, minor: 1 } as const;
@@ -277,7 +278,7 @@ const VOICE_SYSTEM = [
 export async function unifyVoice(
   scenes: readonly DraftedScene[],
   ctx: ReviseContext,
-  batch: BatchRunner,
+  batch: BatchLike,
   opts: { budget?: CostBudget; onProgress?: (d: number, t: number) => void; signal?: AbortSignal } = {},
 ): Promise<DraftedScene[]> {
   const voice = ctx.bible.voice;
@@ -363,7 +364,7 @@ const PAYOFF_SYSTEM = [
 
 export async function auditPayoffs(
   ctx: ReviseContext,
-  llm: Llm,
+  llm: LlmLike,
 ): Promise<PayoffReport> {
   const { value } = await llm.structured(
     {

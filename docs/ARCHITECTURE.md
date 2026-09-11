@@ -153,8 +153,9 @@ more than 40% in either direction.
 
 ### 9. Incremental recompile — `packages/core/src/cache/content-address.ts`
 
-Each scene is content-addressed on `sha256(bible_version, scene_card, assigned_fragments,
-prev_tail_hash, ledger_hash)`.
+Each scene is content-addressed on `sha256(bible_version, scene_card, assigned_fragments)` — and
+matched for reuse on that **key, not on scene identity**, because regenerating an outline mints
+fresh scene ids.
 
 Add a note in month seven and three scenes rebuild, not a hundred thousand words. This is `make` for
 prose, and it is the difference between "your notes become a book as you go along" being a feature
@@ -164,6 +165,15 @@ Cross-scene isolation is deliberate: a change in chapter 40 must not dirty chapt
 rebuilds degenerate into full ones. The price is that cross-book consistency is enforced by the
 holistic passes instead — which is the right trade, because those run over the finished text in a
 single context anyway.
+
+Two things are deliberately **not** in the key. The previous scene's prose and the continuity ledger
+are both empty on a first compile and populated on the next, so folding them in changed every key on
+the second run and rebuilt the entire book. The ledger is worse than unstable — it is extracted
+*from* the manuscript one stage later, so a key containing it depends on its own output. Propagating
+"the scene before me changed" is the cascade's job in `dirtyScenes`, which does it without
+destabilising the key.
+
+An end-to-end run found all of this. See [Bugs the wiring test caught](#bugs-the-wiring-test-caught).
 
 ## Cost
 
@@ -261,6 +271,25 @@ into a syntax error on the user's search screen.
 **Savepoints in both adapters.** SQLite has no nested `BEGIN`, and repository methods call each
 other freely.
 
+## Bugs the wiring test caught
+
+Every stage was unit-tested in isolation before `compile()` had executed a single line. Running the
+eight stages in sequence against a deterministic fake model — `packages/core/test/compile.e2e.test.ts`
+— found three bugs that no amount of per-stage testing would have reached, all of them in the
+product's central claim:
+
+1. **Incremental rebuild never fired.** `sceneKey` folded in the previous scene's prose and the
+   ledger slice, both empty-then-populated across runs. Every key changed on the second compile and
+   the whole book was rewritten at full cost.
+2. **New notes never reached the book.** The outline was reused whenever the Bible version matched,
+   so anything captured after the first compile was allocated to no scene. Scene counts and costs
+   looked healthy; the new writing silently went nowhere. Fixed with `outlineIsStale`, which replans
+   only for genuinely unseen material — a fragment the planner deliberately set aside is not a
+   reason to replan.
+3. **Reuse was matched on scene id.** Regenerating an outline mints fresh ids, so once fix 2 made
+   replanning routine, id-matching would have rebuilt everything anyway. Reuse now matches on the
+   content key and rebinds surviving prose to whatever the new outline calls it.
+
 ## What is not built yet
 
 - Cloud sync transport (the boundary and outbox exist; the wire protocol does not)
@@ -270,3 +299,5 @@ other freely.
 - Widgets, share-sheet capture, voice capture
 - EPUB/DOCX export (Markdown export exists; conversion is a server-side pandoc call)
 - On-device `sqlite-vec` (enabled in the Expo config; the app currently uses the pure-JS path)
+- A real compile against the live API. The pipeline is verified end-to-end against a fake model,
+  which proves the wiring and the schemas but says nothing about prose quality.

@@ -1,19 +1,19 @@
 import { BatchRunner } from "../llm/batch.js";
 import { Llm, type UsageEvent } from "../llm/client.js";
+import type { BatchLike, LlmLike } from "../llm/interfaces.js";
 import { CostBudget } from "../llm/models.js";
-import { dirtyScenes, hashString, sceneKey, tailOf } from "../cache/content-address.js";
+import { dirtyScenes, sceneKey, tailOf } from "../cache/content-address.js";
 import type { EmbeddingProvider } from "../retrieval/embed.js";
 import type { Bible } from "../types/bible.js";
 import type { Fragment } from "../types/fragment.js";
 import type { ContinuityLedger } from "../types/ledger.js";
-import { sliceForScene } from "../types/ledger.js";
 import { asCompileId, newId, type FragmentId, type ProjectId, type SceneId } from "../types/ids.js";
 import type { DraftedScene, Manuscript } from "../types/manuscript.js";
 import { manuscriptCost, manuscriptWords } from "../types/manuscript.js";
-import { allScenes, type Outline } from "../types/outline.js";
+import { allScenes, assignedFragments, type Outline } from "../types/outline.js";
 import type { CompileStatus, Project } from "../types/project.js";
 import { buildBible } from "./bible.js";
-import { draftScenes, type DraftContext } from "./draft.js";
+import { collectTails, draftScenes, type DraftContext } from "./draft.js";
 import { enrichFragments } from "./enrich.js";
 import { buildLedger } from "./ledger.js";
 import { buildOutline, coverage } from "./outline.js";
@@ -83,6 +83,12 @@ export interface CompileOptions {
   readonly onProgress?: (p: CompileProgress) => void;
   readonly onUsage?: (e: UsageEvent) => void;
   readonly signal?: AbortSignal;
+  /**
+   * Model clients, injectable for testing. Production callers omit these and get
+   * real ones built from `apiKey`.
+   */
+  readonly llm?: LlmLike;
+  readonly batch?: BatchLike;
 }
 
 export interface CompileResult {
@@ -114,12 +120,14 @@ const WEIGHTS = {
 
 export async function compile(opts: CompileOptions): Promise<CompileResult> {
   const budget = new CostBudget(opts.budgetUsd);
-  const llm = new Llm({
-    ...(opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
-    budget,
-    ...(opts.onUsage ? { onUsage: opts.onUsage } : {}),
-  });
-  const batch = new BatchRunner(opts.apiKey);
+  const llm: LlmLike =
+    opts.llm ??
+    new Llm({
+      ...(opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
+      budget,
+      ...(opts.onUsage ? { onUsage: opts.onUsage } : {}),
+    });
+  const batch: BatchLike = opts.batch ?? new BatchRunner(opts.apiKey);
   const previous = opts.full === true ? emptyCompileState : (opts.previous ?? emptyCompileState);
 
   let progressBase = 0;
@@ -162,59 +170,51 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
 
   // ---- Stage 4: the outline ----
   report("outlining", 0, "Planning chapters");
-  const outline =
-    previous.outline !== null && previous.outline.bibleVersion === bible.version
-      ? previous.outline
-      : await buildOutline({
-          llm,
-          projectId: opts.project.id,
-          bible,
-          fragments,
-          targetWords: opts.project.targetWords,
-          previous: previous.outline,
-          ...(opts.signal ? { signal: opts.signal } : {}),
-          onProgress: (d, t) =>
-            report("outlining", (d / t) * WEIGHTS.outline, `Planning chapter ${d} of ${t}`),
-        });
+  const outline = outlineIsStale(previous.outline, bible.version, fragments)
+    ? await buildOutline({
+        llm,
+        projectId: opts.project.id,
+        bible,
+        fragments,
+        targetWords: opts.project.targetWords,
+        previous: previous.outline,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+        onProgress: (d, t) =>
+          report("outlining", (d / t) * WEIGHTS.outline, `Planning chapter ${d} of ${t}`),
+      })
+    : previous.outline!;
   finishStage(WEIGHTS.outline);
   abortIfCancelled();
 
   // ---- Stage 5: drafting, incremental ----
   const cards = allScenes(outline);
   const fragmentMap = new Map(fragments.map((f) => [f.id, f]));
-  const previousScenes = new Map(
-    (previous.manuscript?.scenes ?? []).map((s) => [s.sceneId as string, s]),
-  );
-
   // Tails and ledger from the previous build seed the keys; scenes we end up
   // rebuilding will refresh them as we go.
   const tails = new Map<SceneId, string>();
   for (const s of previous.manuscript?.scenes ?? []) tails.set(s.sceneId, tailOf(s.prose));
   const seedLedger = previous.ledger ?? { deltas: [] };
 
-  const currentKeys = new Map<string, string>();
-  cards.forEach((card, i) => {
-    const prevCard = i > 0 ? cards[i - 1] : undefined;
-    const prevTail = prevCard !== undefined ? (tails.get(prevCard.id) ?? "") : "";
-    currentKeys.set(
-      card.id as string,
-      sceneKey({
-        card,
-        bibleVersion: bible.version,
-        fragments: card.fragmentIds
-          .map((id) => fragmentMap.get(id))
-          .filter((f): f is Fragment => f !== undefined),
-        prevTailHash: hashString(prevTail),
-        ledgerHash: hashString(JSON.stringify(sliceForScene(seedLedger, card.present, i))),
-      }),
-    );
-  });
+  const keyed = cards.map((card) => ({
+    id: card.id as string,
+    key: sceneKey({
+      card,
+      bibleVersion: bible.version,
+      fragments: card.fragmentIds
+        .map((id) => fragmentMap.get(id))
+        .filter((f): f is Fragment => f !== undefined),
+    }),
+  }));
 
-  const previousKeys = new Map(
-    [...previousScenes.values()].map((s) => [s.sceneId as string, s.contentHash]),
-  );
-  const order = cards.map((c) => c.id as string);
-  const dirty = dirtyScenes(currentKeys, previousKeys, order);
+  // Previously written prose, indexed by what it was built from rather than by
+  // what it was called. A regenerated outline renames every scene; this is what
+  // lets their prose survive it.
+  const previousByKey = new Map<string, DraftedScene>();
+  for (const scene of previous.manuscript?.scenes ?? []) {
+    previousByKey.set(scene.contentHash, scene);
+  }
+
+  const dirty = dirtyScenes(keyed, new Set(previousByKey.keys()));
 
   const context: DraftContext = {
     bible,
@@ -245,10 +245,30 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
             report("drafting", (d / t) * WEIGHTS.draft, `Writing scene ${d} of ${t}`),
         });
 
+  // Freshly drafted prose is what the ledger and revision stages read next.
+  collectTails(freshlyDrafted, tails);
+
   const draftedById = new Map(freshlyDrafted.map((s) => [s.sceneId as string, s]));
-  let scenes: DraftedScene[] = cards
-    .map((card) => draftedById.get(card.id as string) ?? previousScenes.get(card.id as string))
-    .filter((s): s is DraftedScene => s !== undefined);
+
+  let scenes: DraftedScene[] = [];
+  for (const entry of keyed) {
+    const fresh = draftedById.get(entry.id);
+    if (fresh !== undefined) {
+      scenes.push(fresh);
+      continue;
+    }
+    const reused = previousByKey.get(entry.key);
+    if (reused === undefined) continue;
+
+    // Rebind the reused prose to the scene it now occupies. The outline may have
+    // renamed it; the words are the same words.
+    const card = cards.find((c) => (c.id as string) === entry.id);
+    scenes.push(
+      card === undefined
+        ? reused
+        : { ...reused, sceneId: card.id, chapterId: card.chapterId },
+    );
+  }
 
   if (scenes.length === 0) throw new Error("Compile produced no scenes");
   finishStage(WEIGHTS.draft);
@@ -342,6 +362,40 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
   };
 }
 
+
+/**
+ * Whether the outline has to be rebuilt.
+ *
+ * Reusing it whenever the Bible version matched looked like a sound saving and
+ * was in fact the bug that made the product's central promise false: newly
+ * captured notes were never allocated to any scene, so "your notes become a book
+ * as you go along" quietly did nothing after the first compile.
+ *
+ * A fragment that the planner deliberately set aside is not a reason to replan —
+ * it has already been considered, and the author has been shown it in
+ * `unusedFragments`. Only genuinely unseen material forces a rebuild.
+ *
+ * Regenerating the outline mints new scene ids, but that is no longer expensive:
+ * scene reuse matches on the content key, so unchanged scenes keep their prose
+ * under whatever name the new outline gives them.
+ */
+export function outlineIsStale(
+  outline: Outline | null,
+  bibleVersion: number,
+  fragments: readonly Fragment[],
+): boolean {
+  if (outline === null) return true;
+  if (outline.bibleVersion !== bibleVersion) return true;
+
+  const considered = new Set<string>(assignedFragments(outline));
+  for (const skipped of outline.unusedFragments) considered.add(skipped.fragmentId as string);
+
+  return fragments.some(
+    (f) =>
+      f.deletedAt === null && f.text.trim().length > 0 && !considered.has(f.id as string),
+  );
+}
+
 /**
  * Rebuilds the Bible only when the corpus has meaningfully moved.
  *
@@ -357,7 +411,7 @@ async function reuseOrBuildBible(
   previous: CompileState,
   fragments: readonly Fragment[],
   opts: CompileOptions,
-  llm: Llm,
+  llm: LlmLike,
 ): Promise<Bible> {
   const existing = previous.bible;
   if (existing === null) {

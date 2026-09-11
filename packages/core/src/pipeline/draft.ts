@@ -1,9 +1,10 @@
 import { getForm } from "../forms/registry.js";
-import type { BatchRequest, BatchRunner } from "../llm/batch.js";
-import type { Llm } from "../llm/client.js";
+import type { BatchRequest } from "../llm/batch.js";
+import type { BatchLike, LlmLike } from "../llm/interfaces.js";
+
 import type { CostBudget } from "../llm/models.js";
 import { renderBible, renderFragments, renderLedger, renderSceneCard } from "../prompts/render.js";
-import { hashString, sceneKey, tailOf } from "../cache/content-address.js";
+import { sceneKey, tailOf } from "../cache/content-address.js";
 import type { Bible } from "../types/bible.js";
 import type { Fragment } from "../types/fragment.js";
 import type { ContinuityLedger } from "../types/ledger.js";
@@ -128,7 +129,7 @@ export interface DraftOptions {
   readonly context: DraftContext;
   /** Scene ids to draft. Omit to draft everything in the outline. */
   readonly only?: ReadonlySet<SceneId>;
-  readonly batch: BatchRunner;
+  readonly batch: BatchLike;
   readonly budget?: CostBudget;
   readonly onProgress?: (done: number, total: number) => void;
   readonly signal?: AbortSignal;
@@ -191,11 +192,31 @@ export async function draftScenes(opts: DraftOptions): Promise<DraftedScene[]> {
   return drafted;
 }
 
+/**
+ * Records each drafted scene's closing paragraphs against its id.
+ *
+ * Batched drafting is parallel by construction, so a scene cannot be shown the
+ * prose of the scene before it — that one is being written at the same moment.
+ * Seam repair is the transitions pass's job, and it runs over the finished text
+ * precisely because drafting cannot do it.
+ *
+ * What tails *are* good for is the next compile: on an incremental rebuild the
+ * neighbours are already written, so a rebuilt scene genuinely can continue from
+ * the prose before it. Populating this after a draft is what makes that work.
+ */
+export function collectTails(
+  scenes: readonly DraftedScene[],
+  into: Map<SceneId, string> = new Map(),
+): Map<SceneId, string> {
+  for (const scene of scenes) into.set(scene.sceneId, tailOf(scene.prose));
+  return into;
+}
+
 /** The synchronous path, for previews. Same prompts, full price, immediate. */
 export async function draftSceneNow(
   card: SceneCard,
   context: DraftContext,
-  llm: Llm,
+  llm: LlmLike,
 ): Promise<DraftedScene> {
   const { text } = await llm.prose({
     stage: "draft:preview",
@@ -216,11 +237,6 @@ function finaliseScene(
   model: string,
 ): DraftedScene {
   const prose = stripPreamble(rawText);
-  const scenes = allScenes(ctx.outline);
-  const order = scenes.findIndex((s) => s.id === card.id);
-  const previous = order > 0 ? scenes[order - 1] : undefined;
-  const prevTail = previous !== undefined ? (ctx.tails.get(previous.id) ?? "") : "";
-
   const assigned = card.fragmentIds
     .map((id) => ctx.fragments.get(id))
     .filter((f): f is Fragment => f !== undefined);
@@ -234,10 +250,6 @@ function finaliseScene(
       card,
       bibleVersion: ctx.bible.version,
       fragments: assigned,
-      prevTailHash: hashString(prevTail),
-      ledgerHash: hashString(
-        JSON.stringify(sliceForScene(ctx.ledger, card.present, order < 0 ? 0 : order)),
-      ),
     }),
     passes: ["draft"],
     usedFragments: detectUsedFragments(prose, assigned),

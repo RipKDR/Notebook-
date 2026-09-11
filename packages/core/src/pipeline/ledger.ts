@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getForm } from "../forms/registry.js";
-import type { Llm } from "../llm/client.js";
+import type { LlmLike } from "../llm/interfaces.js";
 import type { Bible } from "../types/bible.js";
 import { DELTA_KINDS, type ContinuityLedger, type StateDelta } from "../types/ledger.js";
 import { appendDeltas } from "../types/ledger.js";
@@ -63,7 +63,7 @@ const SYSTEM = [
 ].join("\n");
 
 export interface ExtractOptions {
-  readonly llm: Llm;
+  readonly llm: LlmLike;
   readonly bible: Bible;
   readonly signal?: AbortSignal;
 }

@@ -34,20 +34,34 @@ export interface SceneKeyInputs {
   readonly bibleVersion: number;
   /** Only the fragments this scene is assigned — not the whole corpus. */
   readonly fragments: readonly Fragment[];
-  /** Hash of the preceding scene's prose tail. Prose continuity is a real input. */
-  readonly prevTailHash: string;
-  /** Hash of the ledger slice this scene will receive. */
-  readonly ledgerHash: string;
 }
 
 /**
  * The build key for one scene.
  *
- * Note what is deliberately *excluded*: the rest of the manuscript. A change in
- * chapter 40 must not dirty chapter 2, or incremental rebuilds degenerate into
- * full rebuilds. The price of that isolation is that cross-book consistency is
- * enforced by the holistic revision passes instead, which is the right trade —
- * those run over the finished text in a single 1M-token context.
+ * It covers exactly the inputs that are **known before drafting and stable
+ * across builds**: the Bible version, the scene card, and the text of the
+ * fragments the scene is obliged to use. Recompile with an unchanged notebook
+ * and every key is identical, so every scene is free.
+ *
+ * Two things are deliberately *not* in the key, and both were in it until an
+ * end-to-end run proved they made incremental rebuilds impossible:
+ *
+ *   - **The previous scene's prose.** It is empty on a first compile and
+ *     populated on the next, so folding it in changes every key on the second
+ *     run and rebuilds the whole book. Propagating "the scene before me changed"
+ *     is `dirtyScenes`' cascade, which does it without destabilising the key.
+ *
+ *   - **The continuity ledger slice.** The ledger is extracted *from* the
+ *     drafted manuscript one stage later, so a key containing it depends on its
+ *     own output — self-referential, and empty-then-populated across runs for
+ *     the same reason as above.
+ *
+ * The rest of the manuscript is excluded too: a change in chapter 40 must not
+ * dirty chapter 2, or incremental rebuilds degenerate into full ones. The price
+ * of that isolation is that cross-book consistency is enforced by the holistic
+ * revision passes instead — the right trade, since those run over the finished
+ * text in a single context anyway.
  */
 export function sceneKey(inputs: SceneKeyInputs): string {
   const fragmentPayload = [...inputs.fragments]
@@ -70,8 +84,6 @@ export function sceneKey(inputs: SceneKeyInputs): string {
         fragmentIds: [...inputs.card.fragmentIds].sort(),
       },
       fragments: fragmentPayload,
-      prevTail: inputs.prevTailHash,
-      ledger: inputs.ledgerHash,
     }),
   );
 }
@@ -103,34 +115,37 @@ export function hashString(s: string): string {
 }
 
 /**
- * Which scenes need rebuilding, given the previous build's keys.
+ * Which scenes need building, given the keys of scenes already written.
  *
- * A scene is dirty if its own key changed, or if a scene before it was rebuilt —
- * because the prev-tail input propagates forward. We cap that propagation at
- * `cascadeLimit` scenes: in practice a rewritten scene perturbs its immediate
- * successor's opening and little beyond, and letting the cascade run to the end
- * of the book would make every edit a full rebuild.
+ * Reuse is matched on the **content key, not the scene id**. That distinction is
+ * load-bearing: regenerating an outline mints fresh scene ids, so matching by id
+ * would mean any outline change rebuilt the entire book — and the outline has to
+ * be regenerated whenever new notes arrive, which is the normal case. Matching on
+ * content means a scene whose card, Bible version and assigned fragments are
+ * unchanged reuses its prose no matter what it is now called.
+ *
+ * A scene is dirty if its key was never built, or if a scene shortly before it
+ * was rebuilt — the cascade, which is how "the scene before me changed"
+ * propagates without destabilising keys. It is capped at `cascadeLimit`: in
+ * practice a rewritten scene perturbs its immediate successor's opening and
+ * little beyond, and an uncapped cascade would make every edit a full rebuild.
  */
 export function dirtyScenes(
-  current: ReadonlyMap<string, string>,
-  previous: ReadonlyMap<string, string>,
-  order: readonly string[],
+  ordered: readonly { readonly id: string; readonly key: string }[],
+  availableKeys: ReadonlySet<string>,
   cascadeLimit: number = 1,
 ): Set<string> {
   const dirty = new Set<string>();
   let cascade = 0;
 
-  for (const sceneId of order) {
-    const now = current.get(sceneId);
-    const before = previous.get(sceneId);
-
-    if (now === undefined || now !== before) {
-      dirty.add(sceneId);
+  for (const scene of ordered) {
+    if (!availableKeys.has(scene.key)) {
+      dirty.add(scene.id);
       cascade = cascadeLimit;
       continue;
     }
     if (cascade > 0) {
-      dirty.add(sceneId);
+      dirty.add(scene.id);
       cascade--;
     }
   }
