@@ -46,16 +46,25 @@ apps/worker       Hono compile service. Holds the model credential.
 ```bash
 pnpm install
 pnpm build          # builds packages/core then packages/db
-pnpm test           # 167 tests
+pnpm test           # 202 tests
 pnpm typecheck
 ```
 
 The worker:
 
 ```bash
-cp apps/worker/.env.example apps/worker/.env   # add ANTHROPIC_API_KEY
+cp apps/worker/.env.example apps/worker/.env
+
+# Add your ANTHROPIC_API_KEY, then generate the token-signing secret:
+pnpm --filter @loom/worker token -- --secret        # put this in LOOM_TOKEN_SECRET
 pnpm --filter @loom/worker dev
+
+# Mint a token for the app (Settings -> Compile service):
+pnpm --filter @loom/worker token -- --sub me --tier paid
 ```
+
+Without `LOOM_TOKEN_SECRET` the worker refuses every authenticated route — it fails closed rather
+than trusting whatever the caller claims.
 
 The app:
 
@@ -83,6 +92,7 @@ Per-stage breakdown in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cost).
 
 ## Status
 
-The compiler, the persistence layer, the app shell and the worker are built and tested. Cloud sync
-transport, billing, a durable job queue, widgets and EPUB export are not — see
+Working end to end: capture, local search, background indexing, threads, compiling a book on the
+worker, and reading it offline. Cloud sync transport, the billing system that mints tokens, a durable
+job queue, widgets and EPUB export are not — see
 [What is not built yet](docs/ARCHITECTURE.md#what-is-not-built-yet).

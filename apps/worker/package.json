@@ -9,7 +9,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "clean": "rm -rf dist .turbo"
+    "clean": "rm -rf dist .turbo",
+    "token": "node --experimental-strip-types src/token-cli.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",

@@ -42,6 +42,21 @@ export class ApiError extends Error {
   }
 }
 
+export interface EnrichPatch {
+  readonly id: string;
+  readonly enrichment: {
+    kind: string;
+    digest: string;
+    entities: { entityId: string; surface: string; kind: string }[];
+    themes: string[];
+    valence: number;
+    standalone: number;
+    enricherVersion: string;
+    enrichedAt: number;
+  } | null;
+  readonly embedding: number[] | null;
+}
+
 export interface ApiConfig {
   readonly baseUrl: string;
   readonly token?: string;
@@ -65,6 +80,24 @@ async function request<T>(config: ApiConfig, path: string, init?: RequestInit): 
     );
   }
   return (await response.json()) as T;
+}
+
+/**
+ * Indexes a batch of fragments.
+ *
+ * Classification needs the model and the model needs the key, so the phone
+ * cannot do this itself. Without this call nothing ever populates a fragment's
+ * digest or embedding, clustering has nothing to cluster, and the Threads screen
+ * stays empty forever.
+ */
+export async function enrich(
+  config: ApiConfig,
+  fragments: readonly { id: string; text: string; createdAt: number }[],
+): Promise<{ embeddingModel: string; patches: EnrichPatch[] }> {
+  return request(config, "/v1/enrich", {
+    method: "POST",
+    body: JSON.stringify({ fragments }),
+  });
 }
 
 /**

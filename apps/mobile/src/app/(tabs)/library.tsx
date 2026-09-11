@@ -20,17 +20,30 @@ export default function LibraryScreen() {
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <Text style={[type.display, { color: palette.ink }]}>Library</Text>
-          <Pressable
-            onPress={() => router.push("/project/new")}
-            accessibilityRole="button"
-            accessibilityLabel="Start a new book"
-            style={({ pressed }) => [
-              styles.newButton,
-              { backgroundColor: palette.accent, opacity: pressed ? 0.85 : 1 },
-            ]}
-          >
-            <Text style={[type.label, { color: palette.surface }]}>New</Text>
-          </Pressable>
+          <View style={styles.headerActions}>
+            <Pressable
+              onPress={() => router.push("/settings")}
+              accessibilityRole="button"
+              accessibilityLabel="Settings"
+              style={({ pressed }) => [
+                styles.iconButton,
+                { backgroundColor: palette.surfaceRaised, opacity: pressed ? 0.85 : 1 },
+              ]}
+            >
+              <Text style={{ fontSize: 18, color: palette.inkSoft }}>⚙</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => router.push("/project/new")}
+              accessibilityRole="button"
+              accessibilityLabel="Start a new book"
+              style={({ pressed }) => [
+                styles.newButton,
+                { backgroundColor: palette.accent, opacity: pressed ? 0.85 : 1 },
+              ]}
+            >
+              <Text style={[type.label, { color: palette.surface }]}>New</Text>
+            </Pressable>
+          </View>
         </View>
         <Text style={[type.caption, { color: palette.inkFaint }]}>
           {projects.data.length === 0
@@ -106,6 +119,14 @@ const styles = StyleSheet.create({
     gap: spacing.xs,
   },
   headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  iconButton: {
+    minHeight: 44,
+    minWidth: 44,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.pill,
+  },
   newButton: {
     minHeight: 44,
     minWidth: 64,

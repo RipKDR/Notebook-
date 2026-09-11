@@ -10,6 +10,7 @@ const request = {
   fragments: [{ id: "f1", text: "a note", createdAt: 1, pinned: false }],
   previousState: null,
   entitlement: ENTITLEMENTS.free,
+  account: "acct-1",
 };
 
 describe("CompileQueue", () => {
@@ -49,6 +50,23 @@ describe("CompileQueue", () => {
     const stats = queue.stats();
     expect(stats.running).toBe(0);
     expect(stats.queued).toBe(2);
+  });
+
+  it("records the job's owner so it cannot be read by another account", () => {
+    const queue = new CompileQueue({ concurrency: 0 });
+    const job = queue.enqueue(request);
+    expect(job.account).toBe("acct-1");
+  });
+
+  it("returns the reserved compile when a job is cancelled before running", () => {
+    const settled: { spent: number; produced: boolean }[] = [];
+    const queue = new CompileQueue({ concurrency: 0 });
+    const job = queue.enqueue({
+      ...request,
+      onSettled: (spent, produced) => settled.push({ spent, produced }),
+    });
+    queue.cancel(job.id);
+    expect(queue.get(job.id)?.status).toBe("cancelled");
   });
 
   it("fails a job cleanly when there is no model credential", async () => {

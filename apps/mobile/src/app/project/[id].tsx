@@ -1,5 +1,5 @@
 import { asProjectId, getForm, type DraftedScene, type Project } from "@loom/core";
-import { useLocalSearchParams, useNavigation } from "expo-router";
+import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -12,6 +12,8 @@ import {
 import { useDatabase } from "@/db/provider";
 import { useFragments, useProjects } from "@/db/hooks";
 import { formatCost, formatWords, pluralise, readingTime } from "@/lib/format";
+import { useCompile, type CompileStatus } from "@/lib/use-compile";
+import { isConfigured, useSettings } from "@/lib/settings";
 import { fonts, radius, spacing, type, usePalette } from "@/theme";
 
 /**
@@ -35,6 +37,7 @@ export default function ProjectScreen() {
   const params = useLocalSearchParams<{ id: string }>();
   const projectId = params.id === undefined ? null : asProjectId(params.id);
 
+  const router = useRouter();
   const projects = useProjects();
   const project = useMemo<Project | null>(
     () => projects.data.find((p) => p.id === projectId) ?? null,
@@ -75,6 +78,13 @@ export default function ProjectScreen() {
       </View>
     );
   }
+
+  const { status, start, cancel, reset } = useCompile(project);
+
+  // A finished compile has written new scenes to SQLite; pull them in.
+  useEffect(() => {
+    if (status.phase === "done") void loadScenes();
+  }, [status.phase, loadScenes]);
 
   const words = scenes.reduce((n, s) => n + s.wordCount, 0);
   const spent = scenes.reduce((n, s) => n + s.costUsd, 0);
@@ -168,7 +178,12 @@ export default function ProjectScreen() {
             </View>
           )}
 
-          <CompileButton
+          <CompileRunner
+            status={status}
+            onStart={() => void start()}
+            onCancel={() => void cancel()}
+            onDismiss={reset}
+            onOpenSettings={() => router.push("/settings")}
             enoughMaterial={fragments.data.length >= 20}
             written={written}
             noteCount={fragments.data.length}
@@ -181,16 +196,116 @@ export default function ProjectScreen() {
   );
 }
 
-function CompileButton({
+/**
+ * The compile control.
+ *
+ * It is a small state machine rather than a button because a compile is a long,
+ * failable, cancellable job, and every one of those states needs somewhere to be
+ * shown. Hiding failure behind a spinner that eventually stops is how a user
+ * concludes the app is broken and stops trusting it with their writing.
+ */
+function CompileRunner({
+  status,
+  onStart,
+  onCancel,
+  onDismiss,
+  onOpenSettings,
   enoughMaterial,
   written,
   noteCount,
 }: {
+  status: CompileStatus;
+  onStart: () => void;
+  onCancel: () => void;
+  onDismiss: () => void;
+  onOpenSettings: () => void;
   enoughMaterial: boolean;
   written: boolean;
   noteCount: number;
 }) {
   const palette = usePalette();
+  const { settings } = useSettings();
+
+  if (status.phase === "running" || status.phase === "starting" || status.phase === "saving") {
+    const progress = status.phase === "running" ? status.progress : null;
+    const fraction = progress?.fraction ?? 0;
+
+    return (
+      <View style={[styles.panel, { backgroundColor: palette.surface, borderColor: palette.accent }]}>
+        <Text style={[type.heading, { color: palette.ink }]}>
+          {status.phase === "saving" ? "Saving your book" : "Writing"}
+        </Text>
+        <Text style={[type.body, { color: palette.inkSoft }]}>
+          {progress?.detail ?? "Getting started"}
+        </Text>
+
+        <View style={[styles.progressTrack, { backgroundColor: palette.surfaceRaised }]}>
+          <View
+            style={[
+              styles.progressFill,
+              { backgroundColor: palette.accent, width: `${Math.round(fraction * 100)}%` },
+            ]}
+          />
+        </View>
+
+        <Text style={[type.caption, { color: palette.inkFaint }]}>
+          {Math.round(fraction * 100)}%
+          {progress !== null && progress.spentUsd > 0
+            ? ` · ${formatCost(progress.spentUsd)} so far`
+            : ""}
+          {" · you can close the app"}
+        </Text>
+
+        {status.phase === "running" ? (
+          <Pressable onPress={onCancel} accessibilityRole="button" style={styles.subtleAction}>
+            <Text style={[type.label, { color: palette.danger }]}>Stop</Text>
+          </Pressable>
+        ) : (
+          <ActivityIndicator color={palette.accent} style={{ marginTop: spacing.sm }} />
+        )}
+      </View>
+    );
+  }
+
+  if (status.phase === "done") {
+    return (
+      <View style={[styles.panel, { backgroundColor: palette.surface, borderColor: palette.success }]}>
+        <Text style={[type.heading, { color: palette.ink }]}>Your book is written</Text>
+        <Text style={[type.body, { color: palette.inkSoft }]}>
+          {formatWords(status.words)} · {Math.round(status.coverage * 100)}% of your notes used
+          {status.unused > 0
+            ? ` · ${status.unused} ${pluralise(status.unused, "note")} did not fit`
+            : ""}
+        </Text>
+        <Text style={[type.caption, { color: palette.inkFaint }]}>
+          Cost {formatCost(status.costUsd)}. Open the Read tab.
+        </Text>
+        <Pressable onPress={onDismiss} accessibilityRole="button" style={styles.subtleAction}>
+          <Text style={[type.label, { color: palette.accent }]}>Done</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  if (status.phase === "failed") {
+    return (
+      <View style={[styles.panel, { backgroundColor: palette.surface, borderColor: palette.danger }]}>
+        <Text style={[type.heading, { color: palette.ink }]}>That did not work</Text>
+        <Text style={[type.body, { color: palette.inkSoft }]}>{status.error}</Text>
+        <Text style={[type.caption, { color: palette.inkFaint }]}>
+          Your notes are untouched. Nothing was lost.
+        </Text>
+        <View style={styles.actionRow}>
+          <Pressable onPress={onStart} accessibilityRole="button" style={styles.subtleAction}>
+            <Text style={[type.label, { color: palette.accent }]}>Try again</Text>
+          </Pressable>
+          <Pressable onPress={onOpenSettings} accessibilityRole="button" style={styles.subtleAction}>
+            <Text style={[type.label, { color: palette.inkSoft }]}>Settings</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
 
   if (!enoughMaterial) {
     return (
@@ -204,8 +319,27 @@ function CompileButton({
     );
   }
 
+  if (!isConfigured(settings)) {
+    return (
+      <Pressable
+        onPress={onOpenSettings}
+        accessibilityRole="button"
+        style={({ pressed }) => [
+          styles.cta,
+          { backgroundColor: palette.surfaceRaised, opacity: pressed ? 0.85 : 1 },
+        ]}
+      >
+        <Text style={[type.heading, { color: palette.ink }]}>Connect a compile service</Text>
+        <Text style={[type.caption, { color: palette.inkSoft }]}>
+          Writing a book runs on a server. Set it up once in Settings.
+        </Text>
+      </Pressable>
+    );
+  }
+
   return (
     <Pressable
+      onPress={onStart}
       accessibilityRole="button"
       style={({ pressed }) => [
         styles.cta,
@@ -218,7 +352,7 @@ function CompileButton({
       <Text style={[type.caption, { color: palette.surface }]}>
         {written
           ? "Only the parts your new notes touch will be rewritten"
-          : "This takes a while. You will get a notification when it is done."}
+          : "This takes a while. You can close the app."}
       </Text>
     </Pressable>
   );
@@ -281,6 +415,8 @@ const styles = StyleSheet.create({
     padding: spacing.md,
     gap: 2,
   },
+  subtleAction: { minHeight: 44, alignItems: "center", justifyContent: "center" },
+  actionRow: { flexDirection: "row", gap: spacing.lg, justifyContent: "center" },
   reader: { paddingHorizontal: spacing.lg, paddingVertical: spacing.xl, paddingBottom: spacing.xxl },
   scene: { gap: spacing.md },
   sceneBreak: { textAlign: "center", paddingVertical: spacing.lg, letterSpacing: 4 },

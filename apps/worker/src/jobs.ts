@@ -35,6 +35,8 @@ export type JobStatus = "queued" | "running" | "complete" | "failed" | "cancelle
 
 export interface JobRecord {
   readonly id: string;
+  /** Account that started it. Jobs are readable only by their owner. */
+  readonly account: string;
   status: JobStatus;
   progress: CompileProgress | null;
   result: CompileResult | null;
@@ -57,6 +59,14 @@ export interface CompileRequest {
   }[];
   readonly previousState: CompileState | null;
   readonly entitlement: Entitlement;
+  readonly account: string;
+  /**
+   * Called once the job reaches a terminal state, with the model spend and
+   * whether it produced a manuscript. This is what returns a reserved compile to
+   * an account whose job failed — charging someone for a book they never got is
+   * the fastest way to lose them.
+   */
+  readonly onSettled?: (spentUsd: number, produced: boolean) => void;
 }
 
 export interface QueueOptions {
@@ -89,6 +99,7 @@ export class CompileQueue {
   enqueue(request: CompileRequest): JobRecord {
     const job: JobRecord = {
       id: newId(),
+      account: request.account,
       status: "queued",
       progress: null,
       result: null,
@@ -143,6 +154,7 @@ export class CompileQueue {
     if (job.controller.signal.aborted) {
       job.status = "cancelled";
       job.finishedAt = Date.now();
+      request.onSettled?.(0, false);
       return;
     }
 
@@ -177,6 +189,7 @@ export class CompileQueue {
       job.error = err instanceof Error ? err.message : String(err);
     } finally {
       job.finishedAt = Date.now();
+      request.onSettled?.(job.result?.costUsd ?? 0, job.status === "complete");
     }
   }
 

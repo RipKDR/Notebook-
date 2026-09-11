@@ -6,6 +6,8 @@ import { useColorScheme } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { DatabaseProvider } from "@/db/provider";
+import { SettingsProvider } from "@/lib/settings-provider";
+import { BackgroundIndexer } from "@/components/BackgroundIndexer";
 import { darkPalette, lightPalette } from "@/theme";
 
 void SplashScreen.preventAutoHideAsync();
@@ -36,26 +38,30 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <ThemeProvider value={navigationTheme}>
           <DatabaseProvider>
-            <StatusBar style={isDark ? "light" : "dark"} />
-            <Stack
-              screenOptions={{
-                headerStyle: { backgroundColor: palette.bg },
-                headerTintColor: palette.ink,
-                headerShadowVisible: false,
-                contentStyle: { backgroundColor: palette.bg },
-              }}
-            >
-              <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-              <Stack.Screen
-                name="fragment/[id]"
-                options={{ title: "Note", presentation: "card" }}
-              />
-              <Stack.Screen name="project/[id]" options={{ title: "" }} />
-              <Stack.Screen
-                name="project/new"
-                options={{ title: "New book", presentation: "modal" }}
-              />
-            </Stack>
+            <SettingsProvider>
+              <BackgroundIndexer />
+              <StatusBar style={isDark ? "light" : "dark"} />
+              <Stack
+                screenOptions={{
+                  headerStyle: { backgroundColor: palette.bg },
+                  headerTintColor: palette.ink,
+                  headerShadowVisible: false,
+                  contentStyle: { backgroundColor: palette.bg },
+                }}
+              >
+                <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                <Stack.Screen
+                  name="fragment/[id]"
+                  options={{ title: "Note", presentation: "card" }}
+                />
+                <Stack.Screen name="project/[id]" options={{ title: "" }} />
+                <Stack.Screen
+                  name="project/new"
+                  options={{ title: "New book", presentation: "modal" }}
+                />
+                <Stack.Screen name="settings" options={{ title: "Settings" }} />
+              </Stack>
+            </SettingsProvider>
           </DatabaseProvider>
         </ThemeProvider>
       </SafeAreaProvider>

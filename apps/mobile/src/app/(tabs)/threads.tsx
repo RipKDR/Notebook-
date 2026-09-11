@@ -12,6 +12,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { EmptyState } from "@/components/EmptyState";
 import { useFragments } from "@/db/hooks";
+import { isConfigured, useSettings } from "@/lib/settings";
 import { formatWords, lengthDescriptor, pluralise } from "@/lib/format";
 import { radius, spacing, type, usePalette } from "@/theme";
 
@@ -34,6 +35,7 @@ export default function ThreadsScreen() {
   const router = useRouter();
 
   const fragments = useFragments({ limit: 5000 });
+  const { settings } = useSettings();
   const [clusters, setClusters] = useState<Constellation[] | null>(null);
   const [loose, setLoose] = useState<number>(0);
 
@@ -77,7 +79,16 @@ export default function ThreadsScreen() {
         </Text>
       </View>
 
-      {indexing && fragments.data.length > 0 ? (
+      {fragments.data.length > 0 && embedded === 0 && !isConfigured(settings) ? (
+        <View style={[styles.notice, { backgroundColor: palette.surfaceRaised }]}>
+          <Text style={[type.caption, styles.noticeText, { color: palette.inkSoft }]}>
+            Threads need your notes read first, which runs on a compile service. Connect one in
+            Settings and they will appear.
+          </Text>
+        </View>
+      ) : null}
+
+      {indexing && embedded > 0 && fragments.data.length > 0 ? (
         <View style={[styles.notice, { backgroundColor: palette.accentSoft }]}>
           <ActivityIndicator size="small" color={palette.accent} />
           <Text style={[type.caption, styles.noticeText, { color: palette.accent }]}>

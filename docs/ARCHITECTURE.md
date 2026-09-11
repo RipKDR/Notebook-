@@ -247,6 +247,18 @@ An app bundle is not a secret. A client-side key is a credential handed to every
 to us. The worker holds it, enforces entitlements, and runs compiles as polled jobs — which is also
 the right shape for work that takes minutes to an hour.
 
+That also decides where enrichment runs. Classification needs the model and the model needs the key,
+so the phone cannot index its own notes: `POST /v1/enrich` does it, and the app drains its queue when
+it comes to the foreground.
+
+**Authorisation is signed, not asserted.** The tier decides how much of our money a caller may spend,
+so it arrives in an HMAC-SHA256 token verified in constant time, never in a header the client sets.
+Quota is claimed *before* a compile starts, in a single SQLite statement so two racing requests
+cannot both pass the check, and released if the job never produces a manuscript. The worker fails
+closed: started without `LOOM_TOKEN_SECRET`, it refuses every authenticated route rather than
+trusting the caller — an unauthenticated fallback is how a misconfigured deployment quietly becomes
+an open, billable endpoint.
+
 ## Notable engineering decisions
 
 **Pure-TypeScript SHA-256** (`cache/sha256.ts`). `node:crypto` is absent on Hermes and `crypto.subtle`
@@ -293,8 +305,9 @@ product's central claim:
 ## What is not built yet
 
 - Cloud sync transport (the boundary and outbox exist; the wire protocol does not)
-- Billing and the real entitlement check — `resolveTier` reads a header, which is marked in the code
-  as development-only
+- Billing itself. Tokens are verified for real (HMAC-SHA256, constant-time, fail-closed) and quota is
+  enforced against a persisted counter, but nothing yet *mints* those tokens from a subscription —
+  `apps/worker/src/token-cli.ts` stands in for it during development
 - Durable job queue — jobs are in-memory, so a worker restart loses in-flight compiles
 - Widgets, share-sheet capture, voice capture
 - EPUB/DOCX export (Markdown export exists; conversion is a server-side pandoc call)
