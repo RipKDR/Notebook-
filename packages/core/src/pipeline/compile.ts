@@ -189,8 +189,9 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
   // ---- Stage 5: drafting, incremental ----
   const cards = allScenes(outline);
   const fragmentMap = new Map(fragments.map((f) => [f.id, f]));
-  // Tails and ledger from the previous build seed the keys; scenes we end up
-  // rebuilding will refresh them as we go.
+  // Prose and ledger from the previous build. These feed the drafting *prompt*
+  // — a rebuilt scene can genuinely continue from the finished scene before it —
+  // but deliberately not the build *key*, which must stay stable across compiles.
   const tails = new Map<SceneId, string>();
   for (const s of previous.manuscript?.scenes ?? []) tails.set(s.sceneId, tailOf(s.prose));
   const seedLedger = previous.ledger ?? { deltas: [] };
@@ -249,6 +250,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
   collectTails(freshlyDrafted, tails);
 
   const draftedById = new Map(freshlyDrafted.map((s) => [s.sceneId as string, s]));
+  const cardById = new Map(cards.map((c) => [c.id as string, c]));
 
   let scenes: DraftedScene[] = [];
   for (const entry of keyed) {
@@ -262,7 +264,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
 
     // Rebind the reused prose to the scene it now occupies. The outline may have
     // renamed it; the words are the same words.
-    const card = cards.find((c) => (c.id as string) === entry.id);
+    const card = cardById.get(entry.id);
     scenes.push(
       card === undefined
         ? reused
