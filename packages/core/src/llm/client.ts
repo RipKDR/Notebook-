@@ -64,13 +64,17 @@ export interface CallSpec {
 }
 
 export class LlmError extends Error {
+  /** Named `underlying` rather than `cause` so it does not shadow `Error.cause`. */
+  readonly underlying: unknown;
+
   constructor(
     message: string,
     readonly stage: string,
-    readonly cause?: unknown,
+    underlying?: unknown,
   ) {
     super(message);
     this.name = "LlmError";
+    this.underlying = underlying;
   }
 }
 

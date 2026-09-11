@@ -78,11 +78,24 @@ export function sceneKey(inputs: SceneKeyInputs): string {
 
 /**
  * The prose tail handed to the next scene for voice and rhythm continuity.
- * Hashed rather than embedded in the key so the key stays a fixed size.
+ *
+ * Cut on a paragraph boundary rather than a word count: the next scene is being
+ * shown this as an example of how the book moves, and a tail that begins
+ * mid-sentence with its paragraphing flattened teaches it the wrong lesson.
+ * Hashed rather than embedded in the build key so the key stays a fixed size.
  */
 export function tailOf(prose: string, words: number = 120): string {
-  const parts = prose.trim().split(/\s+/);
-  return parts.slice(Math.max(0, parts.length - words)).join(" ");
+  const paras = prose.trim().split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paras.length === 0) return "";
+
+  let count = 0;
+  let start = paras.length - 1;
+  for (let i = paras.length - 1; i >= 0; i--) {
+    count += paras[i]!.split(/\s+/).length;
+    start = i;
+    if (count >= words) break;
+  }
+  return paras.slice(start).join("\n\n");
 }
 
 export function hashString(s: string): string {

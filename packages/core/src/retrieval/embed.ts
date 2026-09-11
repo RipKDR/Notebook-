@@ -101,13 +101,13 @@ export class LocalTrigramEmbeddings implements EmbeddingProvider {
 
     // Word unigrams carry topic; character trigrams carry morphology and
     // survive the typos and shorthand that real captured notes are full of.
-    for (const word of clean.split(" ")) {
-      v[this.bucket(`w:${word}`)] += 1;
-    }
+    const bump = (token: string, weight: number): void => {
+      const at = this.bucket(token);
+      v[at] = (v[at] ?? 0) + weight;
+    };
+    for (const word of clean.split(" ")) bump(`w:${word}`, 1);
     const padded = ` ${clean} `;
-    for (let i = 0; i + 3 <= padded.length; i++) {
-      v[this.bucket(`t:${padded.slice(i, i + 3)}`)] += 0.5;
-    }
+    for (let i = 0; i + 3 <= padded.length; i++) bump(`t:${padded.slice(i, i + 3)}`, 0.5);
 
     // Sublinear scaling stops long fragments dominating short ones.
     for (let i = 0; i < v.length; i++) v[i] = Math.log1p(v[i]!);
