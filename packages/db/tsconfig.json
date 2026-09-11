@@ -4,8 +4,16 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "composite": true,
-    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "types": [
+      "node"
+    ]
   },
+  "references": [
+    {
+      "path": "../core"
+    }
+  ],
   "include": [
     "src/**/*"
   ],
