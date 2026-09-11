@@ -1,0 +1,22 @@
+{
+  "name": "loom",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Loose notes in, whole books out. Local-first capture with an AI compiler for long-form work.",
+  "packageManager": "pnpm@9.12.0",
+  "engines": { "node": ">=20.11.0" },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
