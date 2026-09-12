@@ -82,6 +82,21 @@ export interface CompileOptions {
   readonly skipRevision?: boolean;
   readonly onProgress?: (p: CompileProgress) => void;
   readonly onUsage?: (e: UsageEvent) => void;
+  /**
+   * Called at each stage boundary with everything built so far.
+   *
+   * A compile runs for minutes and sometimes the better part of an hour. If the
+   * process dies at minute fifty, the work is gone and someone pays twice for
+   * the same book. A checkpoint is exactly a `CompileState`, which is exactly
+   * what `previous` takes — so resuming is not a special code path: the Bible is
+   * reused because the corpus has not moved, the outline because no fragment is
+   * unseen, and every drafted scene because its content key is unchanged. The
+   * resumed run picks up at the first stage that had not finished.
+   *
+   * Drafting is the one stage with no interior checkpoint: it is a single batch
+   * submission and there is nothing to save until it returns.
+   */
+  readonly onCheckpoint?: (state: CompileState) => void;
   readonly signal?: AbortSignal;
   /**
    * Model clients, injectable for testing. Production callers omit these and get
@@ -146,6 +161,13 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
     if (opts.signal?.aborted === true) throw new CompileCancelledError(budget.spentUsd);
   };
 
+  // Every compile has its id from the outset so that a checkpointed manuscript
+  // and the one finally returned are the same build, not two.
+  const compileId = asCompileId(newId());
+  const checkpoint = (state: Omit<CompileState, "compiledAt">): void => {
+    opts.onCheckpoint?.({ ...state, compiledAt: Date.now() });
+  };
+
   // ---- Stage 1: enrichment (usually a no-op — it runs in the background) ----
   report("enriching", 0, "Reading your notes");
   const patches = await enrichFragments(opts.fragments, {
@@ -166,6 +188,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
   report("bible", 0, "Finding the shape of your book");
   const bible = await reuseOrBuildBible(previous, fragments, opts, llm);
   finishStage(WEIGHTS.bible);
+  checkpoint({ bible, outline: null, manuscript: null, ledger: null });
   abortIfCancelled();
 
   // ---- Stage 4: the outline ----
@@ -184,7 +207,17 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
       })
     : previous.outline!;
   finishStage(WEIGHTS.outline);
+  checkpoint({ bible, outline, manuscript: null, ledger: null });
   abortIfCancelled();
+
+  const snapshot = (drafted: readonly DraftedScene[]): Manuscript => ({
+    projectId: opts.project.id as ProjectId,
+    compileId,
+    bibleVersion: bible.version,
+    outlineVersion: outline.version,
+    scenes: drafted,
+    createdAt: Date.now(),
+  });
 
   // ---- Stage 5: drafting, incremental ----
   const cards = allScenes(outline);
@@ -274,6 +307,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
 
   if (scenes.length === 0) throw new Error("Compile produced no scenes");
   finishStage(WEIGHTS.draft);
+  checkpoint({ bible, outline, manuscript: snapshot(scenes), ledger: null });
   abortIfCancelled();
 
   // ---- Stage 6: continuity ledger ----
@@ -285,6 +319,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
     (d, t) => report("revising", (d / t) * WEIGHTS.ledger, `Tracking continuity (${d}/${t})`),
   );
   finishStage(WEIGHTS.ledger);
+  checkpoint({ bible, outline, manuscript: snapshot(scenes), ledger });
   abortIfCancelled();
 
   // ---- Stage 7: holistic passes ----
@@ -335,15 +370,7 @@ export async function compile(opts: CompileOptions): Promise<CompileResult> {
     finishStage(share);
   }
 
-  const compileId = asCompileId(newId());
-  const manuscript: Manuscript = {
-    projectId: opts.project.id as ProjectId,
-    compileId,
-    bibleVersion: bible.version,
-    outlineVersion: outline.version,
-    scenes,
-    createdAt: Date.now(),
-  };
+  const manuscript = snapshot(scenes);
 
   report("complete", 1, "Done");
 

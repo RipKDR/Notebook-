@@ -127,6 +127,31 @@ export async function getJob(config: ApiConfig, jobId: string): Promise<CompileJ
   return request(config, `/v1/compile/${jobId}`);
 }
 
+export interface CompileSummary {
+  readonly id: string;
+  readonly status: CompileJob["status"];
+  readonly projectId: string;
+  readonly title: string;
+  readonly createdAt: number;
+  readonly finishedAt: number | null;
+  readonly progress: CompileProgress | null;
+  readonly error: string | null;
+  readonly words: number;
+}
+
+/**
+ * The account's recent compiles.
+ *
+ * A compile outlives the app that started it: it runs for minutes to an hour on
+ * the worker, and the phone gets backgrounded, swiped away or restarted in the
+ * meantime. Without this the job id lives only in a React ref, so a user who
+ * closes the app loses sight of a book they have already paid for — even though
+ * the worker finished it.
+ */
+export async function listCompiles(config: ApiConfig): Promise<{ jobs: CompileSummary[] }> {
+  return request(config, "/v1/compiles");
+}
+
 export async function cancelJob(config: ApiConfig, jobId: string): Promise<void> {
   await request(config, `/v1/compile/${jobId}/cancel`, { method: "POST" });
 }

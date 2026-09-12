@@ -7,11 +7,12 @@ import {
   type PassName,
   type Project,
 } from "@loom/core";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useDatabase } from "@/db/provider";
 import {
   cancelJob,
   getManuscript,
+  listCompiles,
   pollJob,
   startCompile,
   type ApiConfig,
@@ -29,6 +30,10 @@ import { isConfigured, useSettings } from "./settings";
  * Fragments are uploaded with the request rather than assumed to be on the
  * server. The free tier never syncs and the paid tier may simply be behind; the
  * compiler needs the notebook as it is now, not as it was at the last sync.
+ *
+ * A compile outlives the screen that started it. Jobs are durable on the worker,
+ * so the app re-attaches to one still running for this project when it opens,
+ * rather than showing an idle button for a book that is halfway written.
  */
 
 export type CompileStatus =
@@ -54,6 +59,55 @@ export function useCompile(project: Project | null) {
     }
     setStatus({ phase: "idle" });
   }, []);
+
+  /**
+   * Follows a job to its end and writes the result into local SQLite.
+   *
+   * Shared by starting a compile and by re-attaching to one, because the two
+   * differ only in how the job id was obtained. Landing the manuscript locally is
+   * the step that matters: once it is written, the book is readable offline
+   * forever, exactly like the notes it came from.
+   */
+  const watch = useCallback(
+    async (config: ApiConfig, jobId: string, controller: AbortController) => {
+      if (project === null) return;
+
+      const finished: CompileJob = await pollJob(config, jobId, {
+        signal: controller.signal,
+        onProgress: (job) => setStatus({ phase: "running", progress: job.progress, jobId }),
+      });
+
+      if (finished.status === "cancelled") {
+        setStatus({ phase: "idle" });
+        return;
+      }
+      if (finished.status === "failed" || finished.result === null) {
+        setStatus({ phase: "failed", error: finished.error ?? "The compile failed." });
+        return;
+      }
+
+      setStatus({ phase: "saving" });
+      const { state, scenes } = await getManuscript(config, jobId);
+
+      const drafted = (scenes as RawScene[]).map(toDraftedScene);
+      await db.saveScenes(project.id, drafted);
+      await db.pruneScenes(
+        project.id,
+        drafted.map((s) => s.sceneId as string),
+      );
+      await db.saveCompileState(project.id, state as Parameters<typeof db.saveCompileState>[1]);
+      touch();
+
+      setStatus({
+        phase: "done",
+        words: finished.result.words,
+        costUsd: finished.result.costUsd,
+        coverage: finished.result.coverage,
+        unused: finished.result.unusedFragments.length,
+      });
+    },
+    [db, project, touch],
+  );
 
   const start = useCallback(async () => {
     if (project === null) return;
@@ -93,43 +147,7 @@ export function useCompile(project: Project | null) {
         previousState,
       });
 
-      jobRef.current = { config, jobId };
-      setStatus({ phase: "running", progress: null, jobId });
-
-      const finished: CompileJob = await pollJob(config, jobId, {
-        signal: controller.signal,
-        onProgress: (job) =>
-          setStatus({ phase: "running", progress: job.progress, jobId }),
-      });
-
-      if (finished.status === "cancelled") {
-        setStatus({ phase: "idle" });
-        return;
-      }
-      if (finished.status === "failed" || finished.result === null) {
-        setStatus({ phase: "failed", error: finished.error ?? "The compile failed." });
-        return;
-      }
-
-      setStatus({ phase: "saving" });
-      const { state, scenes } = await getManuscript(config, jobId);
-
-      const drafted = (scenes as RawScene[]).map(toDraftedScene);
-      await db.saveScenes(project.id, drafted);
-      await db.pruneScenes(
-        project.id,
-        drafted.map((s) => s.sceneId as string),
-      );
-      await db.saveCompileState(project.id, state as Parameters<typeof db.saveCompileState>[1]);
-      touch();
-
-      setStatus({
-        phase: "done",
-        words: finished.result.words,
-        costUsd: finished.result.costUsd,
-        coverage: finished.result.coverage,
-        unused: finished.result.unusedFragments.length,
-      });
+      await watch(config, jobId, controller);
     } catch (err: unknown) {
       if (controller.signal.aborted) {
         setStatus({ phase: "idle" });
@@ -143,9 +161,58 @@ export function useCompile(project: Project | null) {
       jobRef.current = null;
       abortRef.current = null;
     }
-  }, [db, project, settings, touch]);
+  }, [db, project, settings, touch, watch]);
 
-  return { status, start, cancel, reset: () => setStatus({ phase: "idle" }) };
+  /**
+   * Re-attaches to a compile this project already has running on the worker.
+   *
+   * Called when the screen opens. The worker is the durable record of what is in
+   * flight, so there is nothing to remember on the device — which is also why
+   * this survives a reinstall, not just a backgrounding.
+   */
+  const resume = useCallback(async () => {
+    if (project === null) return false;
+    if (!isConfigured(settings)) return false;
+
+    const config: ApiConfig = { baseUrl: settings.baseUrl, token: settings.token };
+    const controller = new AbortController();
+
+    try {
+      const { jobs } = await listCompiles(config);
+      const inflight = jobs.find(
+        (j) =>
+          j.projectId === (project.id as string) &&
+          (j.status === "queued" || j.status === "running"),
+      );
+      if (inflight === undefined) return false;
+
+      abortRef.current = controller;
+      jobRef.current = { config, jobId: inflight.id };
+      setStatus({ phase: "running", progress: inflight.progress, jobId: inflight.id });
+
+      await watch(config, inflight.id, controller);
+      return true;
+    } catch {
+      // A worker that is unreachable at launch is not an error worth showing:
+      // the user has not asked for anything yet.
+      return false;
+    } finally {
+      jobRef.current = null;
+      abortRef.current = null;
+    }
+  }, [project, settings, watch]);
+
+  // Attach once per project, and only when nothing else is already happening.
+  const attached = useRef<string | null>(null);
+  useEffect(() => {
+    if (project === null) return;
+    const key = project.id as string;
+    if (attached.current === key) return;
+    attached.current = key;
+    void resume();
+  }, [project, resume]);
+
+  return { status, start, cancel, resume, reset: () => setStatus({ phase: "idle" }) };
 }
 
 interface RawScene {

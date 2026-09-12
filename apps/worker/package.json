@@ -4,13 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --experimental-sqlite --watch src/server.ts",
-    "start": "node --experimental-sqlite src/server.ts",
+    "dev": "tsx watch --experimental-sqlite src/server.ts",
+    "start": "node --experimental-sqlite dist/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "clean": "rm -rf dist .turbo",
-    "token": "node --experimental-strip-types src/token-cli.ts"
+    "token": "tsx --experimental-sqlite src/token-cli.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
@@ -20,6 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "tsx": "^4.23.13",
     "typescript": "~6.0.3",
     "vitest": "^5.0.0"
   }

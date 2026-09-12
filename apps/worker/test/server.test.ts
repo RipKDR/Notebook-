@@ -4,6 +4,7 @@ import { generateSecret, issueToken } from "../src/auth.js";
 process.env.NODE_ENV = "test";
 process.env.LOOM_TOKEN_SECRET = generateSecret();
 process.env.USAGE_DB = ":memory:";
+process.env.JOBS_DB = ":memory:";
 
 let app: { fetch: (req: Request) => Promise<Response> };
 
@@ -141,5 +142,29 @@ describe("model access", () => {
 
   it("404s a manuscript request for an unknown job", async () => {
     expect((await call("/v1/compile/nope/manuscript", {}, freeToken())).status).toBe(404);
+  });
+});
+
+describe("durable jobs", () => {
+  it("reports that job state survives a restart", async () => {
+    const res = await app.fetch(new Request("http://test/health"));
+    const body = (await res.json()) as {
+      durableJobs: boolean;
+      recovered: { resumed: number; abandoned: number };
+    };
+    expect(body.durableJobs).toBe(true);
+    // A fresh in-memory store has nothing to pick up, but the field must be
+    // there: it is what you look at after a deploy.
+    expect(body.recovered).toEqual({ resumed: 0, abandoned: 0 });
+  });
+
+  it("lists an account's compiles so a client that lost the job id can re-attach", async () => {
+    const res = await call("/v1/compiles", {}, freeToken());
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { jobs: unknown[] }).toEqual({ jobs: [] });
+  });
+
+  it("refuses to list compiles without a token", async () => {
+    expect((await app.fetch(new Request("http://test/v1/compiles"))).status).toBe(401);
   });
 });

@@ -8,10 +8,11 @@ import {
   type EmbeddingProvider,
   type Fragment,
 } from "@loom/core";
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { bearerFrom, verifyToken, type TokenClaims } from "./auth.js";
 import { authorise, ENTITLEMENTS } from "./entitlements.js";
+import { JobStore } from "./job-store.js";
 import { CompileQueue } from "./jobs.js";
 import { UsageStore } from "./usage.js";
 
@@ -36,6 +37,7 @@ const embeddings: EmbeddingProvider =
     : new LocalTrigramEmbeddings();
 
 const usage = UsageStore.open(process.env.USAGE_DB ?? "./loom-usage.db");
+const jobStore = JobStore.open(process.env.JOBS_DB ?? "./loom-jobs.db");
 
 const queue = new CompileQueue({
   ...(apiKey !== undefined ? { apiKey } : {}),
@@ -43,7 +45,27 @@ const queue = new CompileQueue({
     ? { voyageApiKey: process.env.VOYAGE_API_KEY }
     : {}),
   concurrency: Number(process.env.COMPILE_CONCURRENCY ?? 2),
+  store: jobStore,
+  /**
+   * Settlement is wired here rather than per request because a job resumed after
+   * a restart has no request left to carry a closure on. Spend is recorded when
+   * a book was produced; the reservation is handed back when one was not.
+   */
+  onSettled: (account, spentUsd, produced) => {
+    if (produced) usage.recordSpend(account, spentUsd);
+    else usage.release(account);
+  },
 });
+
+/**
+ * Pick up whatever was in flight when this process last stopped.
+ *
+ * A deploy used to destroy every running compile and leave the polling client
+ * with a 404 for a job it had watched reach 80%. Recovery runs before the
+ * listener is bound, so a resumed job is never racing a fresh request for the
+ * same account's quota.
+ */
+const recovered = queue.recover();
 
 const app = new Hono<{ Variables: { claims: TokenClaims } }>();
 
@@ -52,6 +74,8 @@ app.get("/health", (c) =>
     ok: true,
     modelAccess: apiKey !== undefined,
     authConfigured: tokenSecret !== undefined,
+    durableJobs: true,
+    recovered,
     ...queue.stats(),
   }),
 );
@@ -66,7 +90,10 @@ app.get("/v1/tiers", (c) => c.json(ENTITLEMENTS));
  * unauthenticated fallback is how a misconfigured deployment quietly becomes an
  * open, billable endpoint.
  */
-app.use("/v1/compile/*", async (c, next) => {
+const authenticate: MiddlewareHandler<{ Variables: { claims: TokenClaims } }> = async (
+  c,
+  next,
+) => {
   if (tokenSecret === undefined) {
     return c.json({ error: "This worker is not configured to accept requests." }, 503);
   }
@@ -81,19 +108,15 @@ app.use("/v1/compile/*", async (c, next) => {
   c.set("claims", result.claims);
   await next();
   return undefined;
-});
-app.use("/v1/enrich", async (c, next) => {
-  if (tokenSecret === undefined) {
-    return c.json({ error: "This worker is not configured to accept requests." }, 503);
-  }
-  const token = bearerFrom(c.req.header("authorization"));
-  if (token === null) return c.json({ error: "Missing bearer token." }, 401);
-  const result = verifyToken(token, tokenSecret);
-  if (!result.ok) return c.json({ error: result.reason }, 401);
-  c.set("claims", result.claims);
-  await next();
-  return undefined;
-});
+};
+
+// Every route that spends our money or reads someone's writing. Listed
+// explicitly: a route added outside this list is unauthenticated, and the point
+// of the list is that adding one has to be a decision rather than an oversight.
+app.use("/v1/compile", authenticate);
+app.use("/v1/compile/*", authenticate);
+app.use("/v1/compiles", authenticate);
+app.use("/v1/enrich", authenticate);
 
 // ---------------------------------------------------------------------------
 // Enrichment
@@ -230,10 +253,6 @@ app.post("/v1/compile", async (c) => {
       previousState: (parsed.data.previousState ?? null) as never,
       entitlement: decision.entitlement,
       account: claims.sub,
-      onSettled: (spentUsd, ok) => {
-        if (ok) usage.recordSpend(claims.sub, spentUsd);
-        else usage.release(claims.sub);
-      },
     });
 
     return c.json(
@@ -268,6 +287,7 @@ app.get("/v1/compile/:id", (c) => {
     status: job.status,
     progress: job.progress,
     error: job.error,
+    attempts: job.attempts,
     result:
       job.result === null
         ? null
@@ -283,6 +303,29 @@ app.get("/v1/compile/:id", (c) => {
           },
   });
 });
+
+/**
+ * The account's recent jobs.
+ *
+ * A client that was killed mid-poll — reinstalled, or simply swiped away — has
+ * lost the job id it was holding. Without this the compile it already paid for
+ * is unreachable even though the worker finished it.
+ */
+app.get("/v1/compiles", (c) =>
+  c.json({
+    jobs: queue.listForAccount(c.get("claims").sub, 20).map((job) => ({
+      id: job.id,
+      status: job.status,
+      projectId: job.request.projectId,
+      title: job.request.title,
+      createdAt: job.createdAt,
+      finishedAt: job.finishedAt,
+      progress: job.progress,
+      error: job.error,
+      words: job.result?.words ?? 0,
+    })),
+  }),
+);
 
 app.post("/v1/compile/:id/cancel", (c) => {
   const job = ownedJob(c);
@@ -321,4 +364,4 @@ if (process.env.NODE_ENV !== "test") {
   console.log(`loom worker on :${port}${warnings.length > 0 ? ` (${warnings.join("; ")})` : ""}`);
 }
 
-export { app, queue, usage };
+export { app, queue, usage, jobStore };

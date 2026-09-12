@@ -241,6 +241,40 @@ Sync columns (`dirty`, `synced_at`, `remote_rev`) and the outbox ship in the fir
 though sync is a paid feature. Retrofitting those onto a database holding someone's only copy of
 their writing is exactly the migration you never want to write.
 
+## Durable compiles
+
+A compile runs for minutes and sometimes the better part of an hour. Holding that in a `Map` means a
+deploy, an OOM kill or a crashed machine destroys work the user has already been charged for — and
+the client, which is polling, gets a 404 for a job it watched reach 80%.
+
+So job state lives in SQLite and the process holds only what cannot be serialised: the
+`AbortController` of a run currently in flight. On boot, before the port is bound, the worker picks up
+everything left `queued` or `running`.
+
+**Resumption is not a separate code path.** `compile()` emits a checkpoint at each stage boundary, and
+a checkpoint is exactly a `CompileState` — which is exactly what the incremental rebuild already
+consumes. A resumed run therefore reuses the Bible (the corpus has not moved), the outline (no
+fragment is unseen) and every drafted scene (its content key is unchanged), and picks up at the first
+stage that had not finished. A restart costs the stage in flight, not the book.
+
+Two stages have no interior checkpoint, for different reasons. Drafting is a single batch submission:
+there is nothing to save until it returns. The revision passes rewrite prose in place, so a checkpoint
+taken between two of them would be resumed by re-running a pass that had already been applied — which
+costs money and degrades the text. The last checkpoint is therefore the one after the ledger, before
+any revision.
+
+Three things guard the money. Spend from an interrupted attempt is banked, and the next attempt's
+budget is the entitlement minus what has already gone — otherwise a $14 ceiling quietly becomes $42
+across three restarts. Settlement is a conditional `UPDATE`, so two paths racing to finish the same
+job cannot both release the account's quota. And a job that has burned its attempts is failed rather
+than retried, with its reservation released: a compile that kills the worker would otherwise be picked
+up on every boot, taking the service down in a loop.
+
+`GET /v1/compiles` exists for the other half of the same problem. A compile outlives the app that
+started it, so a phone that was swiped away has lost the job id it was holding; the worker is the
+durable record, and the app re-attaches from it on open rather than showing an idle button for a book
+that is halfway written.
+
 ## Why the API key is server-side
 
 An app bundle is not a secret. A client-side key is a credential handed to every installer and billed
@@ -308,7 +342,6 @@ product's central claim:
 - Billing itself. Tokens are verified for real (HMAC-SHA256, constant-time, fail-closed) and quota is
   enforced against a persisted counter, but nothing yet *mints* those tokens from a subscription —
   `apps/worker/src/token-cli.ts` stands in for it during development
-- Durable job queue — jobs are in-memory, so a worker restart loses in-flight compiles
 - Widgets, share-sheet capture, voice capture
 - EPUB/DOCX export (Markdown export exists; conversion is a server-side pandoc call)
 - On-device `sqlite-vec` (enabled in the Expo config; the app currently uses the pure-JS path)

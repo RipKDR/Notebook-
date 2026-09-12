@@ -43,7 +43,11 @@ export type { ModelId, ModelRole, Pricing, TokenUsage, CostOptions } from "./llm
 export { Llm, LlmError } from "./llm/client.js";
 export type { CallSpec, Effort, LlmOptions, UsageEvent } from "./llm/client.js";
 export { BatchRunner } from "./llm/batch.js";
-export type { BatchRequest, BatchResult, BatchProgress } from "./llm/batch.js";
+export type { BatchRequest, BatchResult, BatchProgress, BatchOptions } from "./llm/batch.js";
+// The model surface the pipeline depends on. Exported because `CompileOptions`
+// names these types: without them a caller cannot supply the `llm`/`batch` seam
+// the option advertises.
+export type { LlmLike, BatchLike } from "./llm/interfaces.js";
 
 export { sha256Hex } from "./cache/sha256.js";
 export {

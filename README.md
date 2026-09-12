@@ -46,7 +46,7 @@ apps/worker       Hono compile service. Holds the model credential.
 ```bash
 pnpm install
 pnpm build          # builds packages/core then packages/db
-pnpm test           # 202 tests
+pnpm test           # 238 tests
 pnpm typecheck
 ```
 
@@ -93,6 +93,7 @@ Per-stage breakdown in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cost).
 ## Status
 
 Working end to end: capture, local search, background indexing, threads, compiling a book on the
-worker, and reading it offline. Cloud sync transport, the billing system that mints tokens, a durable
-job queue, widgets and EPUB export are not — see
+worker, and reading it offline. Compiles are durable — a worker restart resumes from the last stage
+boundary rather than losing the run. Cloud sync transport, the billing system that mints tokens,
+widgets and EPUB export are not — see
 [What is not built yet](docs/ARCHITECTURE.md#what-is-not-built-yet).
