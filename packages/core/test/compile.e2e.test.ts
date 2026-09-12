@@ -82,6 +82,7 @@ async function runCompile(
     skipRevision?: boolean;
     budgetUsd?: number;
     progress?: CompileProgress[];
+    checkpoints?: CompileState[];
   } = {},
 ) {
   const llm = new FakeLlm();
@@ -98,6 +99,9 @@ async function runCompile(
     ...(overrides.previous ? { previous: overrides.previous } : {}),
     ...(overrides.skipRevision !== undefined ? { skipRevision: overrides.skipRevision } : {}),
     onProgress: (p) => progress.push(p),
+    ...(overrides.checkpoints
+      ? { onCheckpoint: (state: CompileState) => overrides.checkpoints!.push(state) }
+      : {}),
   });
 
   return { result, llm, batch, progress };
@@ -367,4 +371,107 @@ describe("failure modes", () => {
       }),
     ).rejects.toThrow();
   }, 30_000);
+});
+
+/**
+ * Checkpoints exist so that a worker restart at minute fifty does not throw away
+ * fifty minutes of paid-for generation. The mechanism is deliberately not a new
+ * code path: a checkpoint is a `CompileState`, which is what the incremental
+ * rebuild already consumes, so "resume" and "recompile with nothing changed" are
+ * the same operation.
+ */
+describe("checkpointing and resumption", () => {
+  it("emits a checkpoint at each stage boundary, each one a superset of the last", async () => {
+    const checkpoints: CompileState[] = [];
+    await runCompile({ checkpoints });
+
+    expect(checkpoints.length).toBe(4);
+
+    // Bible, then outline, then prose, then the ledger. Nothing is ever lost
+    // between one checkpoint and the next.
+    expect(checkpoints[0]!.bible).not.toBeNull();
+    expect(checkpoints[0]!.outline).toBeNull();
+
+    expect(checkpoints[1]!.outline).not.toBeNull();
+    expect(checkpoints[1]!.manuscript).toBeNull();
+
+    expect(checkpoints[2]!.manuscript?.scenes.length).toBeGreaterThan(0);
+    expect(checkpoints[2]!.ledger).toBeNull();
+
+    expect(checkpoints[3]!.ledger?.deltas.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("never checkpoints half-revised prose", async () => {
+    // The revision passes rewrite prose in place. A checkpoint taken between two
+    // of them would be resumed by re-running a pass that had already been
+    // applied, which costs money and degrades the text.
+    const checkpoints: CompileState[] = [];
+    await runCompile({ checkpoints });
+
+    for (const state of checkpoints) {
+      for (const scene of state.manuscript?.scenes ?? []) {
+        expect(scene.passes).toEqual(["draft"]);
+      }
+    }
+  }, 30_000);
+
+  it("gives every checkpoint the same compile id as the finished build", async () => {
+    const checkpoints: CompileState[] = [];
+    const { result } = await runCompile({ checkpoints });
+
+    for (const state of checkpoints) {
+      if (state.manuscript !== null) {
+        expect(state.manuscript.compileId).toBe(result.manuscript.compileId);
+      }
+    }
+  }, 30_000);
+
+  it("resumes from a post-drafting checkpoint without redrafting a single scene", async () => {
+    const checkpoints: CompileState[] = [];
+    const first = await runCompile({ checkpoints, fragments: makeFragments() });
+    const afterDrafting = checkpoints[2]!;
+
+    const resumed = await runCompile({
+      fragments: makeFragments(),
+      previous: afterDrafting,
+    });
+
+    // This is the whole point: the expensive stage is not paid for twice.
+    expect(resumed.result.rebuiltScenes).toBe(0);
+    expect(resumed.result.reusedScenes).toBe(resumed.result.manuscript.scenes.length);
+    expect(resumed.batch.stages).not.toContain("draft");
+    expect(resumed.result.manuscript.scenes.length).toBe(
+      first.result.manuscript.scenes.length,
+    );
+  }, 60_000);
+
+  it("resumes from a post-bible checkpoint without rebuilding the Bible", async () => {
+    const checkpoints: CompileState[] = [];
+    await runCompile({ checkpoints, fragments: makeFragments() });
+    const afterBible = checkpoints[0]!;
+
+    const resumed = await runCompile({
+      fragments: makeFragments(),
+      previous: afterBible,
+    });
+
+    expect(resumed.llm.calls.filter((c) => c.stage === "bible")).toHaveLength(0);
+    expect(resumed.result.state.bible?.version).toBe(afterBible.bible?.version);
+  }, 60_000);
+
+  it("resumes from a post-ledger checkpoint and still runs the revision passes", async () => {
+    // The last checkpoint lands before revision, so a resumed run owes the
+    // author those passes — it must not mistake "drafted" for "finished".
+    const checkpoints: CompileState[] = [];
+    await runCompile({ checkpoints, fragments: makeFragments() });
+
+    const resumed = await runCompile({
+      fragments: makeFragments(),
+      previous: checkpoints[3]!,
+    });
+
+    const passes = new Set(resumed.result.manuscript.scenes.flatMap((s) => s.passes));
+    expect(passes).toContain("voice");
+    expect(resumed.result.rebuiltScenes).toBe(0);
+  }, 60_000);
 });

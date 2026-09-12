@@ -4,6 +4,8 @@ import { generateSecret, issueToken } from "../src/auth.js";
 process.env.NODE_ENV = "test";
 process.env.LOOM_TOKEN_SECRET = generateSecret();
 process.env.USAGE_DB = ":memory:";
+process.env.JOBS_DB = ":memory:";
+process.env.SYNC_DB = ":memory:";
 
 let app: { fetch: (req: Request) => Promise<Response> };
 
@@ -141,5 +143,127 @@ describe("model access", () => {
 
   it("404s a manuscript request for an unknown job", async () => {
     expect((await call("/v1/compile/nope/manuscript", {}, freeToken())).status).toBe(404);
+  });
+});
+
+describe("sync", () => {
+  const paidToken = () =>
+    issueToken({ sub: "acct-sync", tier: "paid" }, process.env.LOOM_TOKEN_SECRET!);
+
+  const body = (over: Record<string, unknown> = {}) => ({
+    protocol: 1,
+    since: null,
+    fragments: [],
+    projects: [],
+    ...over,
+  });
+
+  const note = (id: string, text: string) => ({
+    record: {
+      id,
+      projectId: null,
+      text,
+      createdAt: 1000,
+      updatedAt: 1000,
+      source: "quick",
+      deletedAt: null,
+      pinned: false,
+    },
+    baseRev: null,
+  });
+
+  it("refuses to sync without a token", async () => {
+    expect((await post("/v1/sync", body())).status).toBe(401);
+  });
+
+  it("refuses the free tier, because sync is what the paid tier is", async () => {
+    const res = await post("/v1/sync", body(), freeToken());
+    expect(res.status).toBe(402);
+    expect((await res.json()) as { code: string }).toMatchObject({ code: "tier" });
+  });
+
+  it("round-trips a note for a paid account", async () => {
+    const res = await post("/v1/sync", body({ fragments: [note("f1", "a note")] }), paidToken());
+    expect(res.status).toBe(200);
+
+    const payload = (await res.json()) as {
+      protocol: number;
+      cursor: number;
+      accepted: Record<string, number>;
+      fragments: { record: { text: string } }[];
+    };
+    expect(payload.protocol).toBe(1);
+    expect(payload.accepted).toEqual({ f1: 1 });
+    expect(payload.fragments.map((f) => f.record.text)).toEqual(["a note"]);
+    expect(payload.cursor).toBeGreaterThan(0);
+  });
+
+  it("refuses a protocol it does not speak rather than guessing", async () => {
+    // The alternative is to half-apply a request shaped differently from what
+    // we expect, over someone's only copy of their writing.
+    const res = await post("/v1/sync", body({ protocol: 99 }), paidToken());
+    expect(res.status).toBe(409);
+    expect((await res.json()) as { code: string }).toMatchObject({ code: "protocol" });
+  });
+
+  it("rejects a malformed record", async () => {
+    const res = await post(
+      "/v1/sync",
+      body({ fragments: [{ record: { id: "f1" }, baseRev: null }] }),
+      paidToken(),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("reports what it is holding, and deletes it on request", async () => {
+    await post("/v1/sync", body({ fragments: [note("f9", "a note")] }), paidToken());
+
+    const before = (await call("/v1/sync", {}, paidToken())).json() as Promise<{
+      fragments: number;
+      enabled: boolean;
+    }>;
+    expect(await before).toMatchObject({ enabled: true });
+    expect((await before).fragments).toBeGreaterThan(0);
+
+    const deleted = await call("/v1/sync", { method: "DELETE" }, paidToken());
+    expect(deleted.status).toBe(200);
+
+    const after = (await (await call("/v1/sync", {}, paidToken())).json()) as {
+      fragments: number;
+      cursor: number;
+    };
+    expect(after).toMatchObject({ fragments: 0, cursor: 0 });
+  });
+
+  it("keeps one account's notes out of another's sync", async () => {
+    const stranger = issueToken({ sub: "acct-other", tier: "paid" }, process.env.LOOM_TOKEN_SECRET!);
+    await post("/v1/sync", body({ fragments: [note("f-private", "private")] }), paidToken());
+
+    const res = await post("/v1/sync", body(), stranger);
+    expect(((await res.json()) as { fragments: unknown[] }).fragments).toHaveLength(0);
+  });
+});
+
+describe("durable jobs", () => {
+  it("reports that job state survives a restart", async () => {
+    const res = await app.fetch(new Request("http://test/health"));
+    const body = (await res.json()) as {
+      durableJobs: boolean;
+      recovered: { resumed: number; abandoned: number };
+    };
+    expect(body.durableJobs).toBe(true);
+    // A fresh in-memory store has nothing to pick up, but the field must be
+    // there: it is what you look at after a deploy.
+    expect(body.recovered).toEqual({ resumed: 0, abandoned: 0 });
+  });
+
+  it("lists an account's compiles so a client that lost the job id can re-attach", async () => {
+    const res = await call("/v1/compiles", {}, freeToken());
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { jobs: unknown[] }).toEqual({ jobs: [] });
+  });
+
+  it("refuses to list compiles without a token", async () => {
+    expect((await app.fetch(new Request("http://test/v1/compiles"))).status).toBe(401);
   });
 });

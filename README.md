@@ -25,6 +25,8 @@ note in month seven rebuilds the three scenes it affects, not a hundred thousand
 | **Outline** | A plan that names which of your notes every scene must use. |
 | **Draft** | ~80 scene-sized calls in parallel, sharing a cached prompt prefix. |
 | **Revise** | Transitions, continuity, voice, payoff — with the whole manuscript in one context. |
+| **Export** | EPUB, Word or Markdown, written on the device, with the network off. |
+| **Sync** | Notes and books across devices. A conflict keeps both versions, never one. |
 
 The design turns on one measurement: a 100k-word book is ~135k tokens against a **1M-token** window,
 so the whole thing fits seven times over — but the **128k output ceiling** means no single call can
@@ -46,7 +48,7 @@ apps/worker       Hono compile service. Holds the model credential.
 ```bash
 pnpm install
 pnpm build          # builds packages/core then packages/db
-pnpm test           # 202 tests
+pnpm test           # 389 tests
 pnpm typecheck
 ```
 
@@ -93,6 +95,7 @@ Per-stage breakdown in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cost).
 ## Status
 
 Working end to end: capture, local search, background indexing, threads, compiling a book on the
-worker, and reading it offline. Cloud sync transport, the billing system that mints tokens, a durable
-job queue, widgets and EPUB export are not — see
+worker, reading it offline, exporting it as EPUB, Word or Markdown, and syncing the notebook across
+devices. Compiles are durable — a worker restart resumes from the last stage boundary rather than
+losing the run. The billing system that mints tokens and the widgets are not — see
 [What is not built yet](docs/ARCHITECTURE.md#what-is-not-built-yet).

@@ -8,6 +8,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { DatabaseProvider } from "@/db/provider";
 import { SettingsProvider } from "@/lib/settings-provider";
 import { BackgroundIndexer } from "@/components/BackgroundIndexer";
+import { BackgroundSync } from "@/components/BackgroundSync";
 import { darkPalette, lightPalette } from "@/theme";
 
 void SplashScreen.preventAutoHideAsync();
@@ -40,6 +41,7 @@ export default function RootLayout() {
           <DatabaseProvider>
             <SettingsProvider>
               <BackgroundIndexer />
+              <BackgroundSync />
               <StatusBar style={isDark ? "light" : "dark"} />
               <Stack
                 screenOptions={{

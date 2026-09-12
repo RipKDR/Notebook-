@@ -12,6 +12,8 @@
  * in it. That failure is invisible and unfalsifiable, so we pay for the real hash.
  */
 
+import { utf8Bytes } from "./utf8.js";
+
 const K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -25,50 +27,6 @@ const K = new Uint32Array([
 
 function rotr(x: number, n: number): number {
   return ((x >>> n) | (x << (32 - n))) >>> 0;
-}
-
-/**
- * U+FFFD, the replacement character. Unpaired surrogates are not valid Unicode
- * scalars and cannot be encoded as UTF-8. WHATWG (and therefore Node's Buffer,
- * TextEncoder and every browser) substitutes U+FFFD instead. We match that
- * exactly: a note truncated mid-emoji must hash identically on the phone and in
- * the worker, or the scene would rebuild forever on one of them and never on the
- * other.
- */
-const REPLACEMENT = [0xef, 0xbf, 0xbd] as const;
-
-function utf8Bytes(str: string): Uint8Array {
-  // Hermes lacks a guaranteed TextEncoder, so encode by hand.
-  const out: number[] = [];
-  for (let i = 0; i < str.length; i++) {
-    let c = str.charCodeAt(i);
-    if (c < 0x80) {
-      out.push(c);
-    } else if (c < 0x800) {
-      out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-    } else if (c >= 0xd800 && c <= 0xdbff) {
-      // High surrogate. Pair it if we can; otherwise it is an unpaired surrogate.
-      const lo = i + 1 < str.length ? str.charCodeAt(i + 1) : 0;
-      if (lo >= 0xdc00 && lo <= 0xdfff) {
-        c = 0x10000 + ((c - 0xd800) << 10) + (lo - 0xdc00);
-        i++;
-        out.push(
-          0xf0 | (c >> 18),
-          0x80 | ((c >> 12) & 0x3f),
-          0x80 | ((c >> 6) & 0x3f),
-          0x80 | (c & 0x3f),
-        );
-      } else {
-        out.push(...REPLACEMENT);
-      }
-    } else if (c >= 0xdc00 && c <= 0xdfff) {
-      // Unpaired low surrogate.
-      out.push(...REPLACEMENT);
-    } else {
-      out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-    }
-  }
-  return Uint8Array.from(out);
 }
 
 export function sha256Hex(input: string): string {

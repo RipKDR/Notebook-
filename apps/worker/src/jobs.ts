@@ -6,14 +6,24 @@ import {
   asProjectId,
   emptyCompileState,
   newId,
+  type BatchLike,
   type CompileProgress,
   type CompileResult,
   type CompileState,
   type EmbeddingProvider,
   type Fragment,
+  type LlmLike,
   type WorkForm,
 } from "@loom/core";
 import type { Entitlement } from "./entitlements.js";
+import {
+  JobStore,
+  isTerminal,
+  type CompileResultRecord,
+  type JobStatus,
+  type PersistedJob,
+  type PersistedRequest,
+} from "./job-store.js";
 
 /**
  * The compile job queue.
@@ -24,27 +34,17 @@ import type { Entitlement } from "./entitlements.js";
  * backgrounding or a tunnel, so compiles are jobs: the client starts one, gets
  * an id, and polls.
  *
- * This implementation keeps jobs in memory with a bounded concurrency. That is
- * the right shape for a single worker process and the wrong shape for more than
- * one — a restart loses in-flight jobs. Moving to a durable queue (Postgres
- * SKIP LOCKED, or a hosted queue) is a swap of this file alone; the interface
- * the routes depend on does not change.
+ * State lives in SQLite rather than in this process. A deploy in the middle of a
+ * compile used to destroy work the user had already been charged for and leave
+ * the polling client with a 404; now the job is picked up on the next boot and
+ * resumed from its last stage boundary, so the restart costs the stage in flight
+ * rather than the book.
+ *
+ * What is still in memory is only what cannot be serialised: the
+ * `AbortController` for a run currently in flight.
  */
 
-export type JobStatus = "queued" | "running" | "complete" | "failed" | "cancelled";
-
-export interface JobRecord {
-  readonly id: string;
-  /** Account that started it. Jobs are readable only by their owner. */
-  readonly account: string;
-  status: JobStatus;
-  progress: CompileProgress | null;
-  result: CompileResult | null;
-  error: string | null;
-  readonly createdAt: number;
-  finishedAt: number | null;
-  readonly controller: AbortController;
-}
+export type { JobStatus } from "./job-store.js";
 
 export interface CompileRequest {
   readonly projectId: string;
@@ -60,14 +60,18 @@ export interface CompileRequest {
   readonly previousState: CompileState | null;
   readonly entitlement: Entitlement;
   readonly account: string;
-  /**
-   * Called once the job reaches a terminal state, with the model spend and
-   * whether it produced a manuscript. This is what returns a reserved compile to
-   * an account whose job failed — charging someone for a book they never got is
-   * the fastest way to lose them.
-   */
-  readonly onSettled?: (spentUsd: number, produced: boolean) => void;
 }
+
+/**
+ * Called once a job reaches a terminal state, with the model spend and whether
+ * it produced a manuscript.
+ *
+ * This is what returns a reserved compile to an account whose job failed —
+ * charging someone for a book they never got is the fastest way to lose them. It
+ * belongs to the queue rather than to a request because a job recovered after a
+ * restart has no request object left to carry a closure on.
+ */
+export type SettleHook = (account: string, spentUsd: number, produced: boolean) => void;
 
 export interface QueueOptions {
   readonly apiKey?: string;
@@ -76,130 +80,322 @@ export interface QueueOptions {
   readonly concurrency?: number;
   /** How long a finished job's result is retained for collection. */
   readonly retentionMs?: number;
+  /** Where job state is persisted. Defaults to an in-memory store, which is what tests want. */
+  readonly store?: JobStore;
+  readonly onSettled?: SettleHook;
+  /**
+   * How many times a job may be started before we give up on it.
+   *
+   * A job that kills the worker mid-compile would otherwise be picked up again
+   * on every boot, taking the service down in a loop and spending the account's
+   * budget on each pass.
+   */
+  readonly maxAttempts?: number;
+  /**
+   * Model clients, injectable for testing, mirroring the same seam on
+   * `compile()`. A factory rather than an instance because each job gets its own
+   * pair — sharing them across concurrent compiles would interleave their call
+   * logs and their budgets.
+   *
+   * Production callers omit this and get real clients built from `apiKey`.
+   */
+  readonly models?: () => { llm: LlmLike; batch: BatchLike };
+}
+
+/** The queue's view of a job: what is on disk, plus whether it is live in this process. */
+export interface JobView extends PersistedJob {
+  readonly live: boolean;
 }
 
 export class CompileQueue {
-  private readonly jobs = new Map<string, JobRecord>();
-  private readonly pending: { job: JobRecord; request: CompileRequest }[] = [];
+  private readonly store: JobStore;
+  private readonly pending: string[] = [];
+  private readonly live = new Map<string, AbortController>();
   private running = 0;
 
   private readonly concurrency: number;
   private readonly retentionMs: number;
+  private readonly maxAttempts: number;
   private readonly embeddings: EmbeddingProvider;
 
   constructor(private readonly opts: QueueOptions = {}) {
     this.concurrency = opts.concurrency ?? 2;
     this.retentionMs = opts.retentionMs ?? 6 * 60 * 60 * 1000;
+    this.maxAttempts = opts.maxAttempts ?? 3;
+    this.store = opts.store ?? JobStore.open(":memory:");
     this.embeddings =
       opts.voyageApiKey !== undefined
         ? new VoyageEmbeddings(opts.voyageApiKey)
         : new LocalTrigramEmbeddings();
   }
 
-  enqueue(request: CompileRequest): JobRecord {
-    const job: JobRecord = {
-      id: newId(),
+  enqueue(request: CompileRequest): JobView {
+    const id = newId();
+    this.store.create({
+      id,
       account: request.account,
-      status: "queued",
-      progress: null,
-      result: null,
-      error: null,
       createdAt: Date.now(),
-      finishedAt: null,
-      controller: new AbortController(),
-    };
-    this.jobs.set(job.id, job);
-    this.pending.push({ job, request });
+      request: toPersisted(request),
+    });
+    this.pending.push(id);
     this.sweep();
     this.pump();
-    return job;
+    return this.get(id)!;
   }
 
-  get(id: string): JobRecord | null {
-    return this.jobs.get(id) ?? null;
+  /**
+   * Picks up jobs that were queued or in flight when the process stopped.
+   *
+   * Called once at boot, before the server accepts traffic. A job that has
+   * already burned its attempts is failed here rather than retried, and its
+   * reservation released, so the account is not left holding a quota slot for a
+   * compile that will never run.
+   */
+  recover(): { resumed: number; abandoned: number } {
+    let resumed = 0;
+    let abandoned = 0;
+
+    // A process can die after claiming settlement and before touching usage.
+    // Those claims have no owner after a reboot, so recovery drops and reclaims
+    // them before accepting traffic.
+    this.store.clearSettlementClaimsOnRecovery();
+    for (const job of this.store.unsettledTerminal()) {
+      this.finalizeSettlement(
+        job.id,
+        job.account,
+        job.status === "complete"
+          ? job.priorSpendUsd + (job.result?.costUsd ?? 0)
+          : 0,
+        job.status === "complete",
+      );
+    }
+
+    for (const job of this.store.interrupted()) {
+      if (job.attempts >= this.maxAttempts) {
+        this.settle(job.id, "failed", {
+          error: `Abandoned after ${job.attempts} interrupted attempts.`,
+        });
+        abandoned++;
+        continue;
+      }
+      this.pending.push(job.id);
+      resumed++;
+    }
+
+    this.pump();
+    return { resumed, abandoned };
+  }
+
+  get(id: string): JobView | null {
+    const job = this.store.get(id);
+    return job === null ? null : { ...job, live: this.live.has(id) };
+  }
+
+  listForAccount(account: string, limit?: number): readonly JobView[] {
+    return this.store
+      .listForAccount(account, limit)
+      .map((job) => ({ ...job, live: this.live.has(job.id) }));
   }
 
   cancel(id: string): boolean {
-    const job = this.jobs.get(id);
-    if (job === undefined) return false;
-    if (job.status === "complete" || job.status === "failed") return false;
+    const job = this.store.get(id);
+    if (job === null) return false;
+    if (isTerminal(job.status)) return false;
 
-    job.controller.abort();
-    if (job.status === "queued") {
-      const index = this.pending.findIndex((p) => p.job.id === id);
-      if (index >= 0) this.pending.splice(index, 1);
-      job.status = "cancelled";
-      job.finishedAt = Date.now();
+    const controller = this.live.get(id);
+    if (controller !== undefined) {
+      // A running compile aborts at its next stage boundary and settles there.
+      controller.abort();
+      return true;
     }
+
+    // Still queued: drop it before it ever starts.
+    const index = this.pending.indexOf(id);
+    if (index >= 0) this.pending.splice(index, 1);
+    this.settle(id, "cancelled", {});
     return true;
   }
 
   stats(): { queued: number; running: number; total: number } {
-    return { queued: this.pending.length, running: this.running, total: this.jobs.size };
+    return { ...this.store.stats(), queued: this.pending.length, running: this.running };
+  }
+
+  close(): void {
+    if (this.opts.store === undefined) this.store.close();
   }
 
   private pump(): void {
     while (this.running < this.concurrency && this.pending.length > 0) {
-      const next = this.pending.shift();
-      if (next === undefined) break;
+      const id = this.pending.shift();
+      if (id === undefined) break;
       this.running++;
-      void this.run(next.job, next.request).finally(() => {
+      void this.run(id).finally(() => {
         this.running--;
         this.pump();
       });
     }
   }
 
-  private async run(job: JobRecord, request: CompileRequest): Promise<void> {
-    if (job.controller.signal.aborted) {
-      job.status = "cancelled";
-      job.finishedAt = Date.now();
-      request.onSettled?.(0, false);
+  private async run(id: string): Promise<void> {
+    const job = this.store.get(id);
+    if (job === null) return;
+    if (isTerminal(job.status)) return;
+
+    if (!this.store.claimForRun(id, job.attempts)) return;
+    const claimed = this.store.get(id);
+    if (claimed === null) return;
+
+    const controller = new AbortController();
+    this.live.set(id, controller);
+
+    // Resume from the furthest stage boundary this job reached, falling back to
+    // whatever the client uploaded. Resumption is not a special path in the
+    // compiler: a checkpoint is a `CompileState`, so the incremental build
+    // reuses the Bible, the outline and every drafted scene by content key.
+    const previous = claimed.checkpoint ?? claimed.request.previousState;
+    const budgetUsd = claimed.request.entitlement.budgetUsd - claimed.priorSpendUsd;
+
+    if (budgetUsd <= 0) {
+      this.live.delete(id);
+      this.settle(id, "failed", {
+        error: "This compile has already spent its budget across earlier attempts.",
+      });
       return;
     }
 
-    job.status = "running";
+    let progressSpent = claimed.progress?.spentUsd ?? 0;
+    let usageSpent = claimed.progress?.spentUsd ?? 0;
+    let latestProgress = claimed.progress;
+    let spent = Math.max(progressSpent, usageSpent);
+
     try {
       const result = await compile({
         project: {
-          id: asProjectId(request.projectId),
-          title: request.title,
-          form: request.form,
-          targetWords: request.targetWords,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
+          id: asProjectId(claimed.request.projectId),
+          title: claimed.request.title,
+          form: claimed.request.form,
+          targetWords: claimed.request.targetWords,
+          createdAt: claimed.createdAt,
+          updatedAt: claimed.createdAt,
           archivedAt: null,
         },
-        fragments: request.fragments.map(toFragment),
-        previous: request.previousState ?? emptyCompileState,
+        fragments: claimed.request.fragments.map(toFragment),
+        previous: previous ?? emptyCompileState,
         embeddings: this.embeddings,
-        budgetUsd: request.entitlement.budgetUsd,
-        skipRevision: !request.entitlement.revision,
+        budgetUsd,
+        skipRevision: !claimed.request.entitlement.revision,
         ...(this.opts.apiKey !== undefined ? { apiKey: this.opts.apiKey } : {}),
-        signal: job.controller.signal,
-        onProgress: (progress) => {
-          job.progress = progress;
+        ...(this.opts.models !== undefined ? this.opts.models() : {}),
+        signal: controller.signal,
+        onProgress: (next: CompileProgress) => {
+          progressSpent = next.spentUsd;
+          spent = Math.max(progressSpent, usageSpent);
+          latestProgress = { ...next, spentUsd: spent };
+          this.store.saveProgress(id, latestProgress);
+        },
+        onUsage: (event: { costUsd: number }) => {
+          usageSpent += event.costUsd;
+          spent = Math.max(progressSpent, usageSpent);
+          if (latestProgress !== null) {
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+          }
+        },
+        onCheckpoint: (state: CompileState) => {
+          progressSpent = spent;
+          if (latestProgress !== null) {
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+          }
+          this.store.saveCheckpoint(id, state);
         },
       });
 
-      job.result = result;
-      job.status = "complete";
+      spent = result.costUsd;
+      this.live.delete(id);
+      this.settle(id, "complete", { result: toRecord(result), spentUsd: claimed.priorSpendUsd + spent });
     } catch (err: unknown) {
-      job.status = job.controller.signal.aborted ? "cancelled" : "failed";
-      job.error = err instanceof Error ? err.message : String(err);
-    } finally {
-      job.finishedAt = Date.now();
-      request.onSettled?.(job.result?.costUsd ?? 0, job.status === "complete");
+      this.live.delete(id);
+      const cancelled = controller.signal.aborted;
+
+      // Bank what this attempt spent so a resumed run cannot exceed the
+      // entitlement's ceiling by starting a fresh budget each time.
+      this.store.addPriorSpend(id, spent);
+
+      this.settle(id, cancelled ? "cancelled" : "failed", {
+        error: err instanceof Error ? err.message : String(err),
+        spentUsd: claimed.priorSpendUsd + spent,
+      });
     }
   }
 
-  /** Drops finished jobs past their retention window so a long-lived process does not grow without bound. */
-  private sweep(): void {
-    const cutoff = Date.now() - this.retentionMs;
-    for (const [id, job] of this.jobs) {
-      if (job.finishedAt !== null && job.finishedAt < cutoff) this.jobs.delete(id);
+  /**
+   * Moves a job to a terminal state and settles its reservation exactly once.
+   *
+   * The settlement claim is a conditional UPDATE, so two paths racing to finish
+   * the same job — a cancellation and the compile's own rejection, say — cannot
+   * both release the account's quota.
+   */
+  private settle(
+    id: string,
+    status: JobStatus,
+    outcome: { result?: CompileResultRecord; error?: string; spentUsd?: number },
+  ): void {
+    const job = this.store.get(id);
+    if (job === null) return;
+
+    this.store.finish(id, status, {
+      ...(outcome.result !== undefined ? { result: outcome.result } : {}),
+      ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+    });
+
+    this.finalizeSettlement(id, job.account, outcome.spentUsd ?? 0, status === "complete");
+  }
+
+  private finalizeSettlement(id: string, account: string, spentUsd: number, produced: boolean): void {
+    const claim = this.store.claimSettlement(id);
+    if (claim === null) return;
+    try {
+      this.opts.onSettled?.(account, spentUsd, produced);
+      this.store.completeSettlement(id, claim);
+    } catch {
+      this.store.releaseSettlementClaim(id, claim);
     }
   }
+
+  private sweep(): void {
+    this.store.sweep(Date.now() - this.retentionMs);
+  }
+}
+
+function toPersisted(request: CompileRequest): PersistedRequest {
+  return {
+    projectId: request.projectId,
+    title: request.title,
+    form: request.form,
+    targetWords: request.targetWords,
+    fragments: request.fragments,
+    previousState: request.previousState,
+    entitlement: request.entitlement,
+  };
+}
+
+/** Trims the compile result to what a client ever reads back. */
+function toRecord(result: CompileResult): CompileResultRecord {
+  return {
+    compileId: result.compileId,
+    state: result.state,
+    manuscript: { scenes: result.manuscript.scenes },
+    coverage: result.coverage,
+    reusedScenes: result.reusedScenes,
+    rebuiltScenes: result.rebuiltScenes,
+    continuityIssues: result.continuityIssues,
+    continuityAssessment: result.continuityAssessment,
+    unusedFragments: result.unusedFragments.map((u) => ({
+      fragmentId: u.fragmentId as string,
+      reason: u.reason,
+    })),
+    costUsd: result.costUsd,
+    words: result.words,
+  };
 }
 
 /**

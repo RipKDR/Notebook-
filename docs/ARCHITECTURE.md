@@ -206,7 +206,8 @@ packages/core     The compiler. Pure TypeScript, no platform dependencies.
   retrieval/      Vector maths, embeddings, clustering
   pipeline/       The eight stages
   prompts/        Prompt rendering, with the Bible token budget enforced
-  export/         Markdown → pandoc → EPUB/DOCX/PDF
+  export/         Markdown, EPUB and DOCX, from one traversal and one zip writer
+  sync/           The wire protocol and the merge, both shared by phone and worker
 
 packages/db       Local-first SQLite. FTS5 search, sync boundary, two adapters.
 apps/mobile       Expo SDK 57 / RN 0.86. Capture, notes, threads, library, reader.
@@ -231,15 +232,122 @@ Three parts: the question, the evidence, the reckoning.
 Adding a form — essay collection, travel narrative, family history — means one file in
 `packages/core/src/forms/` and one line in the registry. The pipeline does not change.
 
+## Export
+
+A book the author cannot get out of the app is not really theirs. EPUB is what a book is read in;
+DOCX is what it is *worked* in — an editor, a beta reader or an agent needs a file they can leave
+tracked changes in.
+
+Both are zip archives of XML, so one writer in `packages/core/src/export/` serves both, and one
+traversal (`book.ts`) feeds Markdown, EPUB and DOCX alike — doing that traversal three times over is
+how an EPUB ends up with a chapter the Markdown does not have.
+
+**It runs on the device.** The manuscript is already in local SQLite — that is the point of writing
+it there when a compile lands — so asking the worker to package it would mean uploading a finished
+book in order to be sent it back, and would make export the one thing in the app that needs a
+network. Shelling out to pandoc would also put an external binary in the deployment.
+
+Two consequences follow from running on Hermes. Compression is injected rather than assumed
+(`node:zlib` on the worker, nothing on the phone), and a stored EPUB is a valid EPUB — measured at
+about 4x the file size, roughly 700KB for a 100,000-word novel. And `TextEncoder` is not guaranteed,
+which is the same reason `sha256.ts` hashes by hand, so both now share one encoder verified against
+`TextEncoder` including unpaired surrogates.
+
+The export is byte-reproducible: the archive timestamp is fixed, so the same book exports to the same
+file twice. That is what lets a test assert on the bytes rather than on the strings that went into
+them — and the tests read the archives back apart with an independently written reader, because a zip
+with a wrong offset or a stale CRC is a plausible-looking string and an unopenable file.
+
 ## Why local-first
 
 The local SQLite database is the **source of truth**, not a cache of a server. The app is fully
 functional with the network permanently off; cloud sync is a feature layered on top rather than a
 dependency underneath. That ordering is what makes it honest to tell a user their writing is theirs.
 
-Sync columns (`dirty`, `synced_at`, `remote_rev`) and the outbox ship in the first migration even
-though sync is a paid feature. Retrofitting those onto a database holding someone's only copy of
-their writing is exactly the migration you never want to write.
+Sync columns (`dirty`, `synced_at`, `remote_rev`) shipped in the first migration even though sync
+was not built. Retrofitting those onto a database holding someone's only copy of their writing is
+exactly the migration you never want to write.
+
+The outbox that shipped alongside them did not survive contact with the transport, and its failure is
+worth recording: it was a second record of what had changed, and it had already drifted from the
+first. Pinning a note and assigning one to a book both set `dirty` and neither wrote an outbox row,
+so those changes would never have been uploaded. Sync is driven by the flag on the row it describes,
+which cannot disagree with itself, survives a crash mid-upload, and makes re-sending a push that
+already landed harmless.
+
+## Durable compiles
+
+A compile runs for minutes and sometimes the better part of an hour. Holding that in a `Map` means a
+deploy, an OOM kill or a crashed machine destroys work the user has already been charged for — and
+the client, which is polling, gets a 404 for a job it watched reach 80%.
+
+So job state lives in SQLite and the process holds only what cannot be serialised: the
+`AbortController` of a run currently in flight. On boot, before the port is bound, the worker picks up
+everything left `queued` or `running`.
+
+**Resumption is not a separate code path.** `compile()` emits a checkpoint at each stage boundary, and
+a checkpoint is exactly a `CompileState` — which is exactly what the incremental rebuild already
+consumes. A resumed run therefore reuses the Bible (the corpus has not moved), the outline (no
+fragment is unseen) and every drafted scene (its content key is unchanged), and picks up at the first
+stage that had not finished. A restart costs the stage in flight, not the book.
+
+Two stages have no interior checkpoint, for different reasons. Drafting is a single batch submission:
+there is nothing to save until it returns. The revision passes rewrite prose in place, so a checkpoint
+taken between two of them would be resumed by re-running a pass that had already been applied — which
+costs money and degrades the text. The last checkpoint is therefore the one after the ledger, before
+any revision.
+
+Three things guard the money. Spend from an interrupted attempt is banked, and the next attempt's
+budget is the entitlement minus what has already gone — otherwise a $14 ceiling quietly becomes $42
+across three restarts. Settlement is a conditional `UPDATE`, so two paths racing to finish the same
+job cannot both release the account's quota. And a job that has burned its attempts is failed rather
+than retried, with its reservation released: a compile that kills the worker would otherwise be picked
+up on every boot, taking the service down in a loop.
+
+`GET /v1/compiles` exists for the other half of the same problem. A compile outlives the app that
+started it, so a phone that was swiped away has lost the job id it was holding; the worker is the
+durable record, and the app re-attaches from it on open rather than showing an idle button for a book
+that is halfway written.
+
+## Cloud sync
+
+**The source syncs; the build artifact does not.** The notebook is source code and the book is what
+the compiler produced from it. Fragments and projects cross the wire; Bibles, outlines and
+manuscripts do not, because any device with the notes can rebuild them — and shipping a hundred
+thousand words of derived prose to a phone on a train to save a recompile is the wrong trade.
+Enrichment stays local for the same reason, with one cost attached: a restored device re-indexes
+through `/v1/enrich` rather than downloading 4KB of vector per note.
+
+**The cursor is a sequence number, not a timestamp.** "Everything since 14:32" is wrong under clock
+skew, wrong when two writes share a millisecond, and unfixable once a device has skipped a record. A
+server-assigned monotonic integer, allocated in the same transaction as the write, is exact.
+
+Push and pull share one round trip *and one transaction*, so the cursor a client is handed provably
+includes its own writes. Splitting them lets a device push a note and then pull a cursor that
+predates it, which silently drops the note. Both entity types are cut at one shared sequence
+boundary rather than each at its own count: a project necessarily exists before a fragment can be
+assigned to it, so one boundary guarantees a fragment never lands on a device before the project it
+points at — which is otherwise a foreign key error that stops that device's sync dead.
+
+**A conflict never destroys text.** Writes are optimistically concurrent: the client sends the
+revision it last saw, and the server refuses a write whose base is stale. The server's copy stands so
+every device converges, and the rejected text is handed back and kept as a new note. For a product
+whose whole claim is that the user's writing is theirs, silently overwriting a paragraph is the one
+unacceptable failure. A stale base is *not* by itself a conflict — a retried push and two devices
+that captured the same note both produce identical text, and forking a copy there would fill a
+notebook with duplicates and teach the user the sync is unreliable.
+
+Two things the round-trip test caught that the per-stage tests could not:
+
+1. **A fragment arrived before its project**, and the foreign key stopped the whole sync. Fixed on
+   both sides: one page boundary on the server, projects applied before fragments on the client.
+2. **A device re-applied its own pushes.** A push comes back in the same page, by design; writing it
+   again cleared the enrichment derived from its text, so every device would have paid to re-index
+   every note it had just uploaded, on every sync.
+
+The merge lives in `packages/core/src/sync/engine.ts` behind two injected ports, for the same reason
+`compile()` takes an `LlmLike`: the interesting failures are in the merge, not in the HTTP, and a
+merge that can only be exercised through a phone is a merge nobody tests.
 
 ## Why the API key is server-side
 
@@ -304,13 +412,13 @@ product's central claim:
 
 ## What is not built yet
 
-- Cloud sync transport (the boundary and outbox exist; the wire protocol does not)
 - Billing itself. Tokens are verified for real (HMAC-SHA256, constant-time, fail-closed) and quota is
   enforced against a persisted counter, but nothing yet *mints* those tokens from a subscription —
   `apps/worker/src/token-cli.ts` stands in for it during development
-- Durable job queue — jobs are in-memory, so a worker restart loses in-flight compiles
 - Widgets, share-sheet capture, voice capture
-- EPUB/DOCX export (Markdown export exists; conversion is a server-side pandoc call)
+- Enrichment does not sync. It is derived and an embedding is 4KB a note, so a restored device
+  re-indexes through `/v1/enrich` — correct, but it costs the account a re-index it has already paid
+  for once
 - On-device `sqlite-vec` (enabled in the Expo config; the app currently uses the pure-JS path)
 - A real compile against the live API. The pipeline is verified end-to-end against a fake model,
   which proves the wiring and the schemas but says nothing about prose quality.

@@ -13,6 +13,13 @@ import { useDatabase } from "@/db/provider";
 import { useFragments, useProjects } from "@/db/hooks";
 import { formatCost, formatWords, pluralise, readingTime } from "@/lib/format";
 import { useCompile, type CompileStatus } from "@/lib/use-compile";
+import {
+  EXPORT_FORMATS,
+  FORMAT_LABELS,
+  NothingToExportError,
+  shareProject,
+  type ExportFormat,
+} from "@/lib/export";
 import { isConfigured, useSettings } from "@/lib/settings";
 import { fonts, radius, spacing, type, usePalette } from "@/theme";
 
@@ -188,6 +195,8 @@ export default function ProjectScreen() {
             written={written}
             noteCount={fragments.data.length}
           />
+
+          {written ? <ExportPanel project={project} /> : null}
         </ScrollView>
       ) : (
         <Reader scenes={scenes} loading={loadingScenes} />
@@ -358,6 +367,85 @@ function CompileRunner({
   );
 }
 
+/**
+ * Taking the book somewhere else.
+ *
+ * This runs on the device, against the copy already in local SQLite, so it works
+ * with the network off — the same promise the app makes about the notes the book
+ * came from. A book you cannot get out of the app is not really yours.
+ */
+function ExportPanel({ project }: { project: Project }) {
+  const palette = usePalette();
+  const { db } = useDatabase();
+  const [busy, setBusy] = useState<ExportFormat | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = useCallback(
+    async (format: ExportFormat) => {
+      setBusy(format);
+      setError(null);
+      try {
+        await shareProject(db, project, format);
+      } catch (err: unknown) {
+        setError(
+          err instanceof NothingToExportError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : "The export failed.",
+        );
+      } finally {
+        setBusy(null);
+      }
+    },
+    [db, project],
+  );
+
+  return (
+    <View style={[styles.panel, { backgroundColor: palette.surface, borderColor: palette.border }]}>
+      <Text style={[type.label, { color: palette.inkFaint }]}>TAKE IT WITH YOU</Text>
+      <Text style={[type.body, { color: palette.inkSoft }]}>
+        Your book, as a file you own. This works offline.
+      </Text>
+
+      <View style={styles.exportRow}>
+        {EXPORT_FORMATS.map((format) => (
+          <Pressable
+            key={format}
+            onPress={() => void run(format)}
+            disabled={busy !== null}
+            accessibilityRole="button"
+            accessibilityLabel={FORMAT_LABELS[format]}
+            accessibilityState={{ disabled: busy !== null, busy: busy === format }}
+            style={({ pressed }) => [
+              styles.exportButton,
+              {
+                backgroundColor: palette.surfaceRaised,
+                borderColor: palette.border,
+                opacity: busy !== null && busy !== format ? 0.4 : pressed ? 0.85 : 1,
+              },
+            ]}
+          >
+            {busy === format ? (
+              <ActivityIndicator color={palette.accent} />
+            ) : (
+              <Text style={[type.label, { color: palette.ink }]}>{format.toUpperCase()}</Text>
+            )}
+          </Pressable>
+        ))}
+      </View>
+
+      {error !== null ? (
+        <Text style={[type.caption, { color: palette.danger }]}>{error}</Text>
+      ) : (
+        <Text style={[type.caption, { color: palette.inkFaint }]}>
+          EPUB to read · Word to edit · Markdown for anything else
+        </Text>
+      )}
+    </View>
+  );
+}
+
 function Reader({ scenes, loading }: { scenes: readonly DraftedScene[]; loading: boolean }) {
   const palette = usePalette();
 
@@ -416,6 +504,15 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   subtleAction: { minHeight: 44, alignItems: "center", justifyContent: "center" },
+  exportRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm },
+  exportButton: {
+    flex: 1,
+    minHeight: 48,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.md,
+    borderWidth: 1,
+  },
   actionRow: { flexDirection: "row", gap: spacing.lg, justifyContent: "center" },
   reader: { paddingHorizontal: spacing.lg, paddingVertical: spacing.xl, paddingBottom: spacing.xxl },
   scene: { gap: spacing.md },

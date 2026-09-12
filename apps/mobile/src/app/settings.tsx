@@ -12,6 +12,7 @@ import {
 } from "react-native";
 import { useCounts } from "@/db/hooks";
 import { useIndexer } from "@/lib/use-indexer";
+import { useSync } from "@/lib/sync";
 import { isConfigured, tierFromToken, useSettings } from "@/lib/settings";
 import { pluralise } from "@/lib/format";
 import { radius, spacing, type, usePalette } from "@/theme";
@@ -29,6 +30,7 @@ export default function SettingsScreen() {
   const { settings, loading, update } = useSettings();
   const counts = useCounts();
   const indexer = useIndexer();
+  const sync = useSync({ watchAppState: false });
 
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -101,6 +103,44 @@ export default function SettingsScreen() {
             </Text>
           ) : null}
         </View>
+
+        {isConfigured(settings) ? (
+          <View
+            style={[styles.panel, { backgroundColor: palette.surface, borderColor: palette.border }]}
+          >
+            <Text style={[type.heading, { color: palette.ink }]}>Cloud sync</Text>
+            <Text style={[type.body, { color: palette.inkSoft }]}>{syncSummary(sync.status)}</Text>
+            <Text style={[type.caption, { color: palette.inkFaint }]}>
+              Your notes and books, not the written manuscript — that is rebuilt from the notes
+              wherever you need it. This device keeps working with the network off either way.
+            </Text>
+
+            <Pressable
+              onPress={() => void sync.sync()}
+              disabled={sync.status.phase === "syncing"}
+              accessibilityRole="button"
+              accessibilityState={{ busy: sync.status.phase === "syncing" }}
+              style={[styles.action, { backgroundColor: palette.surfaceRaised }]}
+            >
+              {sync.status.phase === "syncing" ? (
+                <ActivityIndicator size="small" color={palette.accent} />
+              ) : (
+                <Text style={[type.label, { color: palette.ink }]}>Sync now</Text>
+              )}
+            </Pressable>
+
+            {sync.status.phase === "failed" ? (
+              <Text style={[type.caption, { color: palette.danger }]}>{sync.status.error}</Text>
+            ) : null}
+            {sync.status.phase === "done" && sync.status.outcome.conflicts > 0 ? (
+              <Text style={[type.caption, { color: palette.accent }]}>
+                {sync.status.outcome.conflicts}{" "}
+                {pluralise(sync.status.outcome.conflicts, "note")} were edited in two places. Both
+                versions were kept — look for the newest notes.
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
 
         <View style={styles.field}>
           <Text style={[type.label, { color: palette.inkSoft }]}>COMPILE SERVICE</Text>
@@ -180,6 +220,34 @@ export default function SettingsScreen() {
       </ScrollView>
     </KeyboardAvoidingView>
   );
+}
+
+/**
+ * What sync is doing, in a sentence.
+ *
+ * Every state gets one, including the ones that are not errors. A user whose
+ * notes are not leaving their phone should be told why, not shown an idle
+ * button that looks identical to a working one.
+ */
+function syncSummary(status: ReturnType<typeof useSync>["status"]): string {
+  switch (status.phase) {
+    case "syncing":
+      return "Syncing your notebook.";
+    case "done": {
+      const { pushed, pulled } = status.outcome;
+      if (pushed === 0 && pulled === 0) return "Everything is up to date.";
+      const parts: string[] = [];
+      if (pushed > 0) parts.push(`sent ${pushed}`);
+      if (pulled > 0) parts.push(`received ${pulled}`);
+      return `Up to date — ${parts.join(", ")}.`;
+    }
+    case "off":
+      return status.reason;
+    case "failed":
+      return "Could not reach the server. Your notes are safe on this device.";
+    default:
+      return "Not synced yet.";
+  }
 }
 
 const styles = StyleSheet.create({

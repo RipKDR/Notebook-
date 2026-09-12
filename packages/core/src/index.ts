@@ -43,9 +43,14 @@ export type { ModelId, ModelRole, Pricing, TokenUsage, CostOptions } from "./llm
 export { Llm, LlmError } from "./llm/client.js";
 export type { CallSpec, Effort, LlmOptions, UsageEvent } from "./llm/client.js";
 export { BatchRunner } from "./llm/batch.js";
-export type { BatchRequest, BatchResult, BatchProgress } from "./llm/batch.js";
+export type { BatchRequest, BatchResult, BatchProgress, BatchOptions } from "./llm/batch.js";
+// The model surface the pipeline depends on. Exported because `CompileOptions`
+// names these types: without them a caller cannot supply the `llm`/`batch` seam
+// the option advertises.
+export type { LlmLike, BatchLike } from "./llm/interfaces.js";
 
 export { sha256Hex } from "./cache/sha256.js";
+export { utf8Bytes } from "./cache/utf8.js";
 export {
   sceneKey,
   tailOf,
@@ -118,5 +123,45 @@ export type {
   CompileState,
 } from "./pipeline/compile.js";
 
+export {
+  SYNC_PROTOCOL_VERSION,
+  SYNC_PAGE_LIMIT,
+  CONFLICT_SUFFIX,
+  fragmentsDiffer,
+  laterOf,
+} from "./sync/protocol.js";
+export type {
+  SyncFragment,
+  SyncProject,
+  SyncPush,
+  SyncRecord,
+  SyncConflict,
+  SyncRequest,
+  SyncResponse,
+} from "./sync/protocol.js";
+export { sync, syncOnce, emptyOutcome, toSyncFragment, toSyncProject } from "./sync/engine.js";
+export type {
+  SyncLocal,
+  SyncTransport,
+  SyncOptions,
+  SyncOutcome,
+  LocalFragment,
+  LocalProject,
+} from "./sync/engine.js";
+
 export { toMarkdown, toPlainText, estimateReadingMinutes } from "./export/format.js";
 export type { ExportOptions } from "./export/format.js";
+export {
+  assembleBook,
+  splitParagraphs,
+  escapeXml,
+  stripInvalidXml,
+  xmlText,
+} from "./export/book.js";
+export type { Book, BookChapter, BookScene, AssembleOptions } from "./export/book.js";
+export { zip, crc32 } from "./export/zip.js";
+export type { ZipEntry, ZipOptions, Deflater } from "./export/zip.js";
+export { toEpub, packageEpub, chapterHref, chapterLabel } from "./export/epub.js";
+export type { EpubOptions } from "./export/epub.js";
+export { toDocx, packageDocx } from "./export/docx.js";
+export type { DocxOptions } from "./export/docx.js";

@@ -16,6 +16,8 @@ import {
   type WorkForm,
   type DraftedScene,
   type PassName,
+  type SyncFragment,
+  type SyncProject,
 } from "@loom/core";
 import type { SqlAdapter, SqlValue } from "./adapter.js";
 import { CONNECTION_PRAGMAS, MIGRATIONS } from "./schema.js";
@@ -46,6 +48,16 @@ interface FragmentRow {
   enricher_version: string | null;
   enriched_at: number | null;
   embedding: Uint8Array | null;
+}
+
+interface ProjectRow {
+  id: string;
+  title: string;
+  form: string;
+  target_words: number;
+  created_at: number;
+  updated_at: number;
+  archived_at: number | null;
 }
 
 interface EntityRow {
@@ -98,7 +110,6 @@ export class LoomDatabase {
        VALUES (?, ?, ?, ?, ?, ?, 1)`,
       [id, projectId, text, now, now, source],
     );
-    await this.enqueueSync("fragment", id, "upsert");
 
     return {
       id,
@@ -122,7 +133,7 @@ export class LoomDatabase {
       // than leaving a stale digest that would mislead the outliner.
       await this.db.run(
         `UPDATE fragments
-            SET text = ?, updated_at = ?, dirty = 1,
+            SET text = ?, updated_at = ?, dirty = 1, local_rev = local_rev + 1,
                 kind = NULL, digest = NULL, themes = NULL, valence = NULL,
                 standalone = NULL, enricher_version = NULL, enriched_at = NULL,
                 embedding = NULL, embedding_model = NULL
@@ -130,7 +141,6 @@ export class LoomDatabase {
         [text, now, id],
       );
       await this.db.run(`DELETE FROM fragment_entities WHERE fragment_id = ?`, [id]);
-      await this.enqueueSync("fragment", id, "upsert");
     });
   }
 
@@ -138,24 +148,25 @@ export class LoomDatabase {
   async softDelete(id: FragmentId): Promise<void> {
     const now = Date.now();
     await this.db.run(
-      `UPDATE fragments SET deleted_at = ?, updated_at = ?, dirty = 1 WHERE id = ?`,
+      `UPDATE fragments SET deleted_at = ?, updated_at = ?, dirty = 1, local_rev = local_rev + 1
+        WHERE id = ?`,
       [now, now, id],
     );
-    await this.enqueueSync("fragment", id, "delete");
   }
 
   async restore(id: FragmentId): Promise<void> {
     const now = Date.now();
     await this.db.run(
-      `UPDATE fragments SET deleted_at = NULL, updated_at = ?, dirty = 1 WHERE id = ?`,
+      `UPDATE fragments SET deleted_at = NULL, updated_at = ?, dirty = 1, local_rev = local_rev + 1
+        WHERE id = ?`,
       [now, id],
     );
-    await this.enqueueSync("fragment", id, "upsert");
   }
 
   async setPinned(id: FragmentId, pinned: boolean): Promise<void> {
     await this.db.run(
-      `UPDATE fragments SET pinned = ?, updated_at = ?, dirty = 1 WHERE id = ?`,
+      `UPDATE fragments SET pinned = ?, updated_at = ?, dirty = 1, local_rev = local_rev + 1
+        WHERE id = ?`,
       [pinned ? 1 : 0, Date.now(), id],
     );
   }
@@ -341,7 +352,8 @@ export class LoomDatabase {
     await this.db.transaction(async () => {
       for (const id of ids) {
         await this.db.run(
-          `UPDATE fragments SET project_id = ?, updated_at = ?, dirty = 1 WHERE id = ?`,
+          `UPDATE fragments SET project_id = ?, updated_at = ?, dirty = 1, local_rev = local_rev + 1
+            WHERE id = ?`,
           [projectId, now, id],
         );
       }
@@ -476,35 +488,294 @@ export class LoomDatabase {
   // Sync outbox
   // -------------------------------------------------------------------------
 
-  private async enqueueSync(entity: string, entityId: string, op: string): Promise<void> {
-    await this.db.run(
-      `INSERT INTO sync_outbox (entity, entity_id, op, created_at) VALUES (?, ?, ?, ?)`,
-      [entity, entityId, op, Date.now()],
-    );
-  }
+  // -------------------------------------------------------------------------
+  // Sync
+  //
+  // Driven by the `dirty` flag on each row rather than by a change log. A log is
+  // a second record of what happened, and a second record can disagree with the
+  // first — the outbox this replaced already did, silently missing pins and
+  // project assignments. A flag on the row it describes cannot drift from it,
+  // survives a crash mid-upload, and makes re-sending a push that already landed
+  // harmless.
+  // -------------------------------------------------------------------------
 
-  async pendingSync(limit: number = 500): Promise<
-    { seq: number; entity: string; entityId: string; op: string; createdAt: number }[]
+  /** Fragments this device has changed since its last successful push. */
+  async dirtyFragments(limit: number = 500): Promise<
+    { fragment: Fragment; baseRev: number | null; localRev: number }[]
   > {
-    const rows = await this.db.all<{
-      seq: number;
-      entity: string;
-      entity_id: string;
-      op: string;
-      created_at: number;
-    }>(`SELECT * FROM sync_outbox ORDER BY seq ASC LIMIT ?`, [limit]);
+    const rows = await this.db.all<
+      FragmentRow & { remote_rev: string | null; local_rev: number }
+    >(`SELECT * FROM fragments WHERE dirty = 1 ORDER BY updated_at ASC LIMIT ?`, [limit]);
 
-    return rows.map((r) => ({
-      seq: r.seq,
-      entity: r.entity,
-      entityId: r.entity_id,
-      op: r.op,
-      createdAt: r.created_at,
+    const hydrated = await this.hydrateAll(rows);
+    return hydrated.map((fragment, i) => ({
+      fragment,
+      baseRev: toRev(rows[i]!.remote_rev),
+      localRev: rows[i]!.local_rev,
     }));
   }
 
-  async clearSynced(upToSeq: number): Promise<void> {
-    await this.db.run(`DELETE FROM sync_outbox WHERE seq <= ?`, [upToSeq]);
+  async dirtyProjects(limit: number = 500): Promise<
+    { project: Project; baseRev: number | null; localRev: number }[]
+  > {
+    const rows = await this.db.all<ProjectRow & { remote_rev: string | null; local_rev: number }>(
+      `SELECT * FROM projects WHERE dirty = 1 ORDER BY updated_at ASC LIMIT ?`,
+      [limit],
+    );
+    return rows.map((r) => ({
+      project: hydrateProject(r),
+      baseRev: toRev(r.remote_rev),
+      localRev: r.local_rev,
+    }));
+  }
+
+  async countDirty(): Promise<{ fragments: number; projects: number }> {
+    const one = async (table: string): Promise<number> => {
+      const row = await this.db.first<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE dirty = 1`,
+      );
+      return row?.n ?? 0;
+    };
+    return { fragments: await one("fragments"), projects: await one("projects") };
+  }
+
+  /**
+   * Marks records as pushed, at the revisions the server assigned.
+   *
+   * Only clears `dirty` where `local_rev` still matches what was uploaded: a
+   * note edited while the request was in flight is still dirty, and clearing it
+   * would strand that edit on the device for ever.
+   *
+   * The comparison is on the counter rather than on `updated_at` because two
+   * edits in the same millisecond share a timestamp, and this has to be exactly
+   * right — the failure it guards against is silent, and the thing it loses is
+   * something the user typed.
+   */
+  async markSynced(
+    entity: "fragments" | "projects",
+    acked: readonly { id: string; rev: number; localRev: number }[],
+  ): Promise<void> {
+    if (acked.length === 0) return;
+    const now = Date.now();
+    await this.db.transaction(async () => {
+      for (const ack of acked) {
+        await this.db.run(
+          `UPDATE ${entity} SET dirty = 0, synced_at = ?, remote_rev = ?
+            WHERE id = ? AND local_rev = ?`,
+          [now, String(ack.rev), ack.id, ack.localRev],
+        );
+        // The server's revision is recorded either way, so a row that moved on
+        // pushes from the right base next time rather than being rejected as
+        // stale for ever.
+        await this.db.run(`UPDATE ${entity} SET remote_rev = ? WHERE id = ?`, [
+          String(ack.rev),
+          ack.id,
+        ]);
+      }
+    });
+  }
+
+  /**
+   * Writes records received from the server.
+   *
+   * They arrive clean: this device did not author them, so it has nothing to
+   * push back. Writing them dirty would bounce every record between two devices
+   * indefinitely.
+   *
+   * A local row that is still dirty is left alone — its own edit has not been
+   * uploaded yet, and the server will adjudicate on the next push. Overwriting it
+   * here would destroy writing that has never left the device.
+   */
+  async applyRemoteFragments(
+    incoming: readonly { record: SyncFragment; rev: number }[],
+  ): Promise<{ applied: number; skipped: number }> {
+    let applied = 0;
+    let skipped = 0;
+
+    await this.db.transaction(async () => {
+      for (const { record, rev } of incoming) {
+        const existing = await this.db.first<{ dirty: number; text: string }>(
+          `SELECT dirty, text FROM fragments WHERE id = ?`,
+          [record.id],
+        );
+        if (existing !== null && existing.dirty === 1) {
+          skipped++;
+          continue;
+        }
+
+        await this.db.run(
+          `INSERT INTO fragments (id, project_id, text, created_at, updated_at, source,
+                                  deleted_at, pinned, dirty, synced_at, remote_rev)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             project_id = excluded.project_id,
+             text       = excluded.text,
+             updated_at = excluded.updated_at,
+             source     = excluded.source,
+             deleted_at = excluded.deleted_at,
+             pinned     = excluded.pinned,
+             dirty      = 0,
+             synced_at  = excluded.synced_at,
+             remote_rev = excluded.remote_rev,
+             local_rev  = fragments.local_rev + 1`,
+          [
+            record.id,
+            record.projectId,
+            record.text,
+            record.createdAt,
+            record.updatedAt,
+            record.source,
+            record.deletedAt,
+            record.pinned ? 1 : 0,
+            Date.now(),
+            String(rev),
+          ],
+        );
+
+        // Enrichment is derived from the text and did not travel with it, so a
+        // fragment whose words just changed has to be re-indexed. Leaving a
+        // stale digest in place would mislead the outliner.
+        //
+        // Only when the words actually changed. A record can arrive with text
+        // this device already has — an echo of its own push, or a note whose
+        // pinned flag moved — and discarding a perfectly good digest for that
+        // means paying the model again to derive the same answer.
+        if (existing !== null && existing.text !== record.text) {
+          await this.db.run(
+            `UPDATE fragments
+                SET kind = NULL, digest = NULL, themes = NULL, valence = NULL,
+                    standalone = NULL, enricher_version = NULL, enriched_at = NULL,
+                    embedding = NULL, embedding_model = NULL
+              WHERE id = ?`,
+            [record.id],
+          );
+          await this.db.run(`DELETE FROM fragment_entities WHERE fragment_id = ?`, [record.id]);
+        }
+        applied++;
+      }
+    });
+
+    return { applied, skipped };
+  }
+
+  async applyRemoteProjects(
+    incoming: readonly { record: SyncProject; rev: number }[],
+  ): Promise<{ applied: number; skipped: number }> {
+    let applied = 0;
+    let skipped = 0;
+
+    await this.db.transaction(async () => {
+      for (const { record, rev } of incoming) {
+        const existing = await this.db.first<{ dirty: number }>(
+          `SELECT dirty FROM projects WHERE id = ?`,
+          [record.id],
+        );
+        if (existing !== null && existing.dirty === 1) {
+          skipped++;
+          continue;
+        }
+
+        await this.db.run(
+          `INSERT INTO projects (id, title, form, target_words, created_at, updated_at,
+                                 archived_at, dirty, synced_at, remote_rev)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             title        = excluded.title,
+             form         = excluded.form,
+             target_words = excluded.target_words,
+             updated_at   = excluded.updated_at,
+             archived_at  = excluded.archived_at,
+             dirty        = 0,
+             synced_at    = excluded.synced_at,
+             remote_rev   = excluded.remote_rev,
+             local_rev    = projects.local_rev + 1`,
+          [
+            record.id,
+            record.title,
+            record.form,
+            record.targetWords,
+            record.createdAt,
+            record.updatedAt,
+            record.archivedAt,
+            Date.now(),
+            String(rev),
+          ],
+        );
+        applied++;
+      }
+    });
+
+    return { applied, skipped };
+  }
+
+  /**
+   * Stores a version the server rejected, as a new note.
+   *
+   * The alternative is to drop it, and dropping a paragraph someone wrote is the
+   * one failure this product cannot have. It comes back as an ordinary fragment
+   * so it is searchable, compilable and deletable like any other.
+   */
+  async saveConflictCopy(original: SyncFragment, marker: string): Promise<Fragment> {
+    const now = Date.now();
+    const id = asFragmentId(newId(now));
+    await this.db.run(
+      `INSERT INTO fragments (id, project_id, text, created_at, updated_at, source, dirty)
+       VALUES (?, ?, ?, ?, ?, ?, 1)`,
+      [id, original.projectId, original.text + marker, original.createdAt, now, "import"],
+    );
+
+    return {
+      id,
+      projectId: original.projectId === null ? null : asProjectId(original.projectId),
+      text: original.text + marker,
+      createdAt: original.createdAt,
+      updatedAt: now,
+      source: "import",
+      deletedAt: null,
+      pinned: false,
+      enrichment: null,
+      embedding: null,
+    };
+  }
+
+  /** Where this device has reached in the server's log. */
+  async syncState(): Promise<{ cursor: number; lastSyncedAt: number | null; lastError: string | null }> {
+    const row = await this.db.first<{
+      cursor: number;
+      last_synced_at: number | null;
+      last_error: string | null;
+    }>(`SELECT cursor, last_synced_at, last_error FROM sync_state WHERE id = 1`);
+
+    return {
+      cursor: row?.cursor ?? 0,
+      lastSyncedAt: row?.last_synced_at ?? null,
+      lastError: row?.last_error ?? null,
+    };
+  }
+
+  async setSyncCursor(cursor: number, error: string | null = null): Promise<void> {
+    await this.db.run(
+      `UPDATE sync_state SET cursor = ?, last_synced_at = ?, last_error = ? WHERE id = 1`,
+      [cursor, Date.now(), error],
+    );
+  }
+
+  /**
+   * Forgets this device's sync position without touching a word of the writing.
+   *
+   * Everything becomes dirty again, so the next sync re-uploads the whole
+   * notebook. That is the recovery path when a cursor is wrong: re-sending is
+   * cheap and idempotent, and the alternative is a device that has quietly
+   * stopped syncing some of someone's notes.
+   */
+  async resetSync(): Promise<void> {
+    await this.db.transaction(async () => {
+      await this.db.run(`UPDATE fragments SET dirty = 1, remote_rev = NULL`);
+      await this.db.run(`UPDATE projects SET dirty = 1, remote_rev = NULL`);
+      await this.db.run(
+        `UPDATE sync_state SET cursor = 0, last_synced_at = NULL, last_error = NULL WHERE id = 1`,
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -590,4 +861,30 @@ export function toFtsPhrase(query: string): string | null {
 
   if (tokens.length === 0) return null;
   return tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(" ");
+}
+
+function hydrateProject(row: ProjectRow): Project {
+  return {
+    id: asProjectId(row.id),
+    title: row.title,
+    form: row.form as WorkForm,
+    targetWords: row.target_words,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at,
+  };
+}
+
+/**
+ * Reads a revision back out of its column.
+ *
+ * `remote_rev` was declared TEXT in the first migration, before the protocol
+ * existed and settled on integers. SQLite stores what it is given, so the value
+ * can come back as either — and `Number(null)` is 0, which would be a valid
+ * revision and a wrong one.
+ */
+function toRev(value: string | number | null): number | null {
+  if (value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
