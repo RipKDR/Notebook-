@@ -50,6 +50,7 @@ export type { BatchRequest, BatchResult, BatchProgress, BatchOptions } from "./l
 export type { LlmLike, BatchLike } from "./llm/interfaces.js";
 
 export { sha256Hex } from "./cache/sha256.js";
+export { utf8Bytes } from "./cache/utf8.js";
 export {
   sceneKey,
   tailOf,
@@ -124,3 +125,17 @@ export type {
 
 export { toMarkdown, toPlainText, estimateReadingMinutes } from "./export/format.js";
 export type { ExportOptions } from "./export/format.js";
+export {
+  assembleBook,
+  splitParagraphs,
+  escapeXml,
+  stripInvalidXml,
+  xmlText,
+} from "./export/book.js";
+export type { Book, BookChapter, BookScene, AssembleOptions } from "./export/book.js";
+export { zip, crc32 } from "./export/zip.js";
+export type { ZipEntry, ZipOptions, Deflater } from "./export/zip.js";
+export { toEpub, packageEpub, chapterHref, chapterLabel } from "./export/epub.js";
+export type { EpubOptions } from "./export/epub.js";
+export { toDocx, packageDocx } from "./export/docx.js";
+export type { DocxOptions } from "./export/docx.js";

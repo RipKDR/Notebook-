@@ -206,7 +206,7 @@ packages/core     The compiler. Pure TypeScript, no platform dependencies.
   retrieval/      Vector maths, embeddings, clustering
   pipeline/       The eight stages
   prompts/        Prompt rendering, with the Bible token budget enforced
-  export/         Markdown → pandoc → EPUB/DOCX/PDF
+  export/         Markdown, EPUB and DOCX, from one traversal and one zip writer
 
 packages/db       Local-first SQLite. FTS5 search, sync boundary, two adapters.
 apps/mobile       Expo SDK 57 / RN 0.86. Capture, notes, threads, library, reader.
@@ -230,6 +230,32 @@ Three parts: the question, the evidence, the reckoning.
 
 Adding a form — essay collection, travel narrative, family history — means one file in
 `packages/core/src/forms/` and one line in the registry. The pipeline does not change.
+
+## Export
+
+A book the author cannot get out of the app is not really theirs. EPUB is what a book is read in;
+DOCX is what it is *worked* in — an editor, a beta reader or an agent needs a file they can leave
+tracked changes in.
+
+Both are zip archives of XML, so one writer in `packages/core/src/export/` serves both, and one
+traversal (`book.ts`) feeds Markdown, EPUB and DOCX alike — doing that traversal three times over is
+how an EPUB ends up with a chapter the Markdown does not have.
+
+**It runs on the device.** The manuscript is already in local SQLite — that is the point of writing
+it there when a compile lands — so asking the worker to package it would mean uploading a finished
+book in order to be sent it back, and would make export the one thing in the app that needs a
+network. Shelling out to pandoc would also put an external binary in the deployment.
+
+Two consequences follow from running on Hermes. Compression is injected rather than assumed
+(`node:zlib` on the worker, nothing on the phone), and a stored EPUB is a valid EPUB — measured at
+about 4x the file size, roughly 700KB for a 100,000-word novel. And `TextEncoder` is not guaranteed,
+which is the same reason `sha256.ts` hashes by hand, so both now share one encoder verified against
+`TextEncoder` including unpaired surrogates.
+
+The export is byte-reproducible: the archive timestamp is fixed, so the same book exports to the same
+file twice. That is what lets a test assert on the bytes rather than on the strings that went into
+them — and the tests read the archives back apart with an independently written reader, because a zip
+with a wrong offset or a stale CRC is a plausible-looking string and an unopenable file.
 
 ## Why local-first
 
@@ -343,7 +369,6 @@ product's central claim:
   enforced against a persisted counter, but nothing yet *mints* those tokens from a subscription —
   `apps/worker/src/token-cli.ts` stands in for it during development
 - Widgets, share-sheet capture, voice capture
-- EPUB/DOCX export (Markdown export exists; conversion is a server-side pandoc call)
 - On-device `sqlite-vec` (enabled in the Expo config; the app currently uses the pure-JS path)
 - A real compile against the live API. The pipeline is verified end-to-end against a fake model,
   which proves the wiring and the schemas but says nothing about prose quality.
