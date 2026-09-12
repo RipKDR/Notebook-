@@ -207,6 +207,7 @@ packages/core     The compiler. Pure TypeScript, no platform dependencies.
   pipeline/       The eight stages
   prompts/        Prompt rendering, with the Bible token budget enforced
   export/         Markdown, EPUB and DOCX, from one traversal and one zip writer
+  sync/           The wire protocol and the merge, both shared by phone and worker
 
 packages/db       Local-first SQLite. FTS5 search, sync boundary, two adapters.
 apps/mobile       Expo SDK 57 / RN 0.86. Capture, notes, threads, library, reader.
@@ -263,9 +264,16 @@ The local SQLite database is the **source of truth**, not a cache of a server. T
 functional with the network permanently off; cloud sync is a feature layered on top rather than a
 dependency underneath. That ordering is what makes it honest to tell a user their writing is theirs.
 
-Sync columns (`dirty`, `synced_at`, `remote_rev`) and the outbox ship in the first migration even
-though sync is a paid feature. Retrofitting those onto a database holding someone's only copy of
-their writing is exactly the migration you never want to write.
+Sync columns (`dirty`, `synced_at`, `remote_rev`) shipped in the first migration even though sync
+was not built. Retrofitting those onto a database holding someone's only copy of their writing is
+exactly the migration you never want to write.
+
+The outbox that shipped alongside them did not survive contact with the transport, and its failure is
+worth recording: it was a second record of what had changed, and it had already drifted from the
+first. Pinning a note and assigning one to a book both set `dirty` and neither wrote an outbox row,
+so those changes would never have been uploaded. Sync is driven by the flag on the row it describes,
+which cannot disagree with itself, survives a crash mid-upload, and makes re-sending a push that
+already landed harmless.
 
 ## Durable compiles
 
@@ -300,6 +308,46 @@ up on every boot, taking the service down in a loop.
 started it, so a phone that was swiped away has lost the job id it was holding; the worker is the
 durable record, and the app re-attaches from it on open rather than showing an idle button for a book
 that is halfway written.
+
+## Cloud sync
+
+**The source syncs; the build artifact does not.** The notebook is source code and the book is what
+the compiler produced from it. Fragments and projects cross the wire; Bibles, outlines and
+manuscripts do not, because any device with the notes can rebuild them — and shipping a hundred
+thousand words of derived prose to a phone on a train to save a recompile is the wrong trade.
+Enrichment stays local for the same reason, with one cost attached: a restored device re-indexes
+through `/v1/enrich` rather than downloading 4KB of vector per note.
+
+**The cursor is a sequence number, not a timestamp.** "Everything since 14:32" is wrong under clock
+skew, wrong when two writes share a millisecond, and unfixable once a device has skipped a record. A
+server-assigned monotonic integer, allocated in the same transaction as the write, is exact.
+
+Push and pull share one round trip *and one transaction*, so the cursor a client is handed provably
+includes its own writes. Splitting them lets a device push a note and then pull a cursor that
+predates it, which silently drops the note. Both entity types are cut at one shared sequence
+boundary rather than each at its own count: a project necessarily exists before a fragment can be
+assigned to it, so one boundary guarantees a fragment never lands on a device before the project it
+points at — which is otherwise a foreign key error that stops that device's sync dead.
+
+**A conflict never destroys text.** Writes are optimistically concurrent: the client sends the
+revision it last saw, and the server refuses a write whose base is stale. The server's copy stands so
+every device converges, and the rejected text is handed back and kept as a new note. For a product
+whose whole claim is that the user's writing is theirs, silently overwriting a paragraph is the one
+unacceptable failure. A stale base is *not* by itself a conflict — a retried push and two devices
+that captured the same note both produce identical text, and forking a copy there would fill a
+notebook with duplicates and teach the user the sync is unreliable.
+
+Two things the round-trip test caught that the per-stage tests could not:
+
+1. **A fragment arrived before its project**, and the foreign key stopped the whole sync. Fixed on
+   both sides: one page boundary on the server, projects applied before fragments on the client.
+2. **A device re-applied its own pushes.** A push comes back in the same page, by design; writing it
+   again cleared the enrichment derived from its text, so every device would have paid to re-index
+   every note it had just uploaded, on every sync.
+
+The merge lives in `packages/core/src/sync/engine.ts` behind two injected ports, for the same reason
+`compile()` takes an `LlmLike`: the interesting failures are in the merge, not in the HTTP, and a
+merge that can only be exercised through a phone is a merge nobody tests.
 
 ## Why the API key is server-side
 
@@ -364,11 +412,13 @@ product's central claim:
 
 ## What is not built yet
 
-- Cloud sync transport (the boundary and outbox exist; the wire protocol does not)
 - Billing itself. Tokens are verified for real (HMAC-SHA256, constant-time, fail-closed) and quota is
   enforced against a persisted counter, but nothing yet *mints* those tokens from a subscription —
   `apps/worker/src/token-cli.ts` stands in for it during development
 - Widgets, share-sheet capture, voice capture
+- Enrichment does not sync. It is derived and an embedding is 4KB a note, so a restored device
+  re-indexes through `/v1/enrich` — correct, but it costs the account a re-index it has already paid
+  for once
 - On-device `sqlite-vec` (enabled in the Expo config; the app currently uses the pure-JS path)
 - A real compile against the live API. The pipeline is verified end-to-end against a fake model,
   which proves the wiring and the schemas but says nothing about prose quality.

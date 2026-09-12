@@ -53,10 +53,10 @@ describe("capture", () => {
     expect(list.map((f) => f.text)).toEqual(["second", "first"]);
   });
 
-  it("queues every capture for sync", async () => {
+  it("marks every capture for sync", async () => {
     await db.capture("a");
     await db.capture("b");
-    expect(await db.pendingSync()).toHaveLength(2);
+    expect(await db.countDirty()).toEqual({ fragments: 2, projects: 0 });
   });
 });
 

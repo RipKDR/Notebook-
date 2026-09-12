@@ -123,6 +123,32 @@ export type {
   CompileState,
 } from "./pipeline/compile.js";
 
+export {
+  SYNC_PROTOCOL_VERSION,
+  SYNC_PAGE_LIMIT,
+  CONFLICT_SUFFIX,
+  fragmentsDiffer,
+  laterOf,
+} from "./sync/protocol.js";
+export type {
+  SyncFragment,
+  SyncProject,
+  SyncPush,
+  SyncRecord,
+  SyncConflict,
+  SyncRequest,
+  SyncResponse,
+} from "./sync/protocol.js";
+export { sync, syncOnce, emptyOutcome, toSyncFragment, toSyncProject } from "./sync/engine.js";
+export type {
+  SyncLocal,
+  SyncTransport,
+  SyncOptions,
+  SyncOutcome,
+  LocalFragment,
+  LocalProject,
+} from "./sync/engine.js";
+
 export { toMarkdown, toPlainText, estimateReadingMinutes } from "./export/format.js";
 export type { ExportOptions } from "./export/format.js";
 export {

@@ -115,6 +115,9 @@ importers:
         specifier: ^4.1.13
         version: 4.6.2
     devDependencies:
+      '@loom/db':
+        specifier: workspace:^
+        version: link:../../packages/db
       '@types/node':
         specifier: ^22.10.2
         version: 22.20.2
@@ -5859,7 +5862,9 @@ snapshots:
       metro-runtime: 0.84.6
     transitivePeerDependencies:
       - '@babel/core'
+      - bufferutil
       - supports-color
+      - utf-8-validate
 
   '@react-native/normalize-colors@0.74.89': {}
 

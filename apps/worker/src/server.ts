@@ -3,6 +3,8 @@ import {
   LocalTrigramEmbeddings,
   Llm,
   VoyageEmbeddings,
+  SYNC_PAGE_LIMIT,
+  SYNC_PROTOCOL_VERSION,
   asFragmentId,
   enrichFragments,
   type EmbeddingProvider,
@@ -13,6 +15,7 @@ import { z } from "zod";
 import { bearerFrom, verifyToken, type TokenClaims } from "./auth.js";
 import { authorise, ENTITLEMENTS } from "./entitlements.js";
 import { JobStore } from "./job-store.js";
+import { SyncStore } from "./sync-store.js";
 import { CompileQueue } from "./jobs.js";
 import { UsageStore } from "./usage.js";
 
@@ -38,6 +41,7 @@ const embeddings: EmbeddingProvider =
 
 const usage = UsageStore.open(process.env.USAGE_DB ?? "./loom-usage.db");
 const jobStore = JobStore.open(process.env.JOBS_DB ?? "./loom-jobs.db");
+const syncStore = SyncStore.open(process.env.SYNC_DB ?? "./loom-sync.db");
 
 const queue = new CompileQueue({
   ...(apiKey !== undefined ? { apiKey } : {}),
@@ -117,6 +121,7 @@ app.use("/v1/compile", authenticate);
 app.use("/v1/compile/*", authenticate);
 app.use("/v1/compiles", authenticate);
 app.use("/v1/enrich", authenticate);
+app.use("/v1/sync", authenticate);
 
 // ---------------------------------------------------------------------------
 // Enrichment
@@ -189,6 +194,115 @@ app.post("/v1/enrich", async (c) => {
       502,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
+
+/**
+ * What crosses the wire.
+ *
+ * The source, not the build artifact. Fragments and projects are what the user
+ * typed and cannot be regenerated; a Bible, an outline and a manuscript are
+ * output the compiler can rebuild on any device that has the notes. Shipping a
+ * hundred thousand words of derived prose to a phone on a train to save a
+ * recompile is the wrong trade.
+ */
+const syncFragmentSchema = z.object({
+  id: z.string().min(1).max(64),
+  projectId: z.string().min(1).max(64).nullable().default(null),
+  text: z.string().max(100_000),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  source: z.enum(["quick", "widget", "share", "voice", "import", "editor"]).default("quick"),
+  deletedAt: z.number().int().nullable().default(null),
+  pinned: z.boolean().default(false),
+});
+
+const syncProjectSchema = z.object({
+  id: z.string().min(1).max(64),
+  title: z.string().min(1).max(300),
+  form: z.enum(["fiction", "memoir"]),
+  targetWords: z.number().int().min(1).max(1_000_000),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  archivedAt: z.number().int().nullable().default(null),
+});
+
+const pushOf = <T extends z.ZodType>(record: T) =>
+  z.object({ record, baseRev: z.number().int().nullable().default(null) });
+
+const syncRequestSchema = z.object({
+  protocol: z.number().int(),
+  since: z.number().int().nonnegative().nullable().default(null),
+  fragments: z.array(pushOf(syncFragmentSchema)).max(SYNC_PAGE_LIMIT).default([]),
+  projects: z.array(pushOf(syncProjectSchema)).max(SYNC_PAGE_LIMIT).default([]),
+  limit: z.number().int().min(1).max(SYNC_PAGE_LIMIT).optional(),
+});
+
+/**
+ * One round trip: push what changed here, pull what changed there.
+ *
+ * Both halves share a transaction, so the cursor a client is handed provably
+ * includes its own writes. Splitting them lets a device push a note and then
+ * pull a cursor that predates it, which silently drops the note.
+ */
+app.post("/v1/sync", async (c) => {
+  const claims = c.get("claims");
+  if (!ENTITLEMENTS[claims.tier].cloudSync) {
+    return c.json(
+      { error: "Cloud sync is part of the paid plan. Your writing stays on your device.", code: "tier" },
+      402,
+    );
+  }
+
+  const parsed = syncRequestSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: "Invalid request", detail: parsed.error.issues.slice(0, 5) }, 400);
+  }
+  if (parsed.data.protocol !== SYNC_PROTOCOL_VERSION) {
+    // Refuse rather than guess. A client speaking a protocol we do not know is
+    // holding someone's only copy of their writing.
+    return c.json(
+      {
+        error: `This app is too old to sync with this server (protocol ${parsed.data.protocol}, expected ${SYNC_PROTOCOL_VERSION}). Update the app.`,
+        code: "protocol",
+      },
+      409,
+    );
+  }
+
+  const result = syncStore.sync(claims.sub, {
+    since: parsed.data.since,
+    fragments: parsed.data.fragments,
+    projects: parsed.data.projects,
+    ...(parsed.data.limit !== undefined ? { limit: parsed.data.limit } : {}),
+  });
+
+  return c.json({ protocol: SYNC_PROTOCOL_VERSION, ...result });
+});
+
+/** What the server holds for this account, so a user can see it and delete it. */
+app.get("/v1/sync", (c) => {
+  const claims = c.get("claims");
+  return c.json({
+    protocol: SYNC_PROTOCOL_VERSION,
+    enabled: ENTITLEMENTS[claims.tier].cloudSync,
+    cursor: syncStore.head(claims.sub),
+    ...syncStore.counts(claims.sub),
+  });
+});
+
+/**
+ * Stops syncing and removes everything the server holds.
+ *
+ * A user who turns sync off and finds their notes still on our disk has been
+ * lied to. The device keeps its own copy — it was always the source of truth.
+ */
+app.delete("/v1/sync", (c) => {
+  syncStore.forget(c.get("claims").sub);
+  return c.json({ deleted: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -364,4 +478,4 @@ if (process.env.NODE_ENV !== "test") {
   console.log(`loom worker on :${port}${warnings.length > 0 ? ` (${warnings.join("; ")})` : ""}`);
 }
 
-export { app, queue, usage, jobStore };
+export { app, queue, usage, jobStore, syncStore };

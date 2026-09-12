@@ -66,6 +66,7 @@ beforeAll(async () => {
   process.env.NODE_ENV = "test";
   process.env.LOOM_TOKEN_SECRET = secret;
   process.env.USAGE_DB = ":memory:";
+  process.env.SYNC_DB = ":memory:";
   process.env.JOBS_DB = dbPath;
 
   ({ app } = await import("../src/server.js"));

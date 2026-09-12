@@ -6,7 +6,7 @@
  * database file rather than in a table we could forget to write.
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export interface Migration {
   readonly version: number;
@@ -179,6 +179,50 @@ CREATE TABLE sync_outbox (
   payload    TEXT,
   created_at INTEGER NOT NULL
 );
+`.trim(),
+  },
+  {
+    // Cloud sync. Fragments already carried their sync columns from the first
+    // migration, because retrofitting those onto a database holding someone's
+    // only copy of their writing is exactly the migration you do not want to be
+    // writing later. Projects did not, and the device needs somewhere to keep
+    // its position in the server's log.
+    version: 2,
+    sql: `
+-- The outbox goes. It was a second record of what had changed, and it had
+-- already drifted from the first: pinning a note and assigning one to a book
+-- both set the dirty flag and neither wrote an outbox row, so those changes
+-- would never have been uploaded. One flag on the row it describes cannot
+-- disagree with itself, and re-sending a push that already landed is harmless.
+DROP TABLE sync_outbox;
+
+-- A local revision counter, bumped on every local write.
+--
+-- Acknowledging a push has to clear the dirty flag only if the row has not
+-- changed since it was read, and updated_at cannot answer that: two edits in
+-- the same millisecond share a timestamp, and clearing the flag on the second
+-- one strands that edit on the device for ever. A counter that only ever goes
+-- up cannot be ambiguous.
+ALTER TABLE fragments ADD COLUMN local_rev INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE projects  ADD COLUMN local_rev INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE projects ADD COLUMN dirty      INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE projects ADD COLUMN synced_at  INTEGER;
+ALTER TABLE projects ADD COLUMN remote_rev TEXT;
+
+CREATE INDEX projects_dirty ON projects(dirty) WHERE dirty = 1;
+
+-- Exactly one row. The cursor is the server sequence this device has applied;
+-- a timestamp would be wrong under clock skew and unrecoverable once a record
+-- had been skipped.
+CREATE TABLE sync_state (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  cursor         INTEGER NOT NULL DEFAULT 0,
+  last_synced_at INTEGER,
+  last_error     TEXT
+);
+
+INSERT INTO sync_state (id, cursor) VALUES (1, 0);
 `.trim(),
   },
 ];

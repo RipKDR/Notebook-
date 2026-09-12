@@ -19,6 +19,7 @@
     "zod": "^4.1.13"
   },
   "devDependencies": {
+    "@loom/db": "workspace:^",
     "@types/node": "^22.10.2",
     "tsx": "^4.23.13",
     "typescript": "~6.0.3",
