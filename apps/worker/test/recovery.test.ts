@@ -37,7 +37,7 @@ beforeAll(async () => {
   // retention window.
   const store = JobStore.open(dbPath);
   store.create({ id: "in-flight", account: "acct-1", createdAt: Date.now(), request });
-  store.markRunning("in-flight");
+  store.markRunning("in-flight", "crashed-test-worker", 0, 0);
   store.saveProgress("in-flight", {
     status: "drafting",
     fraction: 0.61,
@@ -68,6 +68,8 @@ beforeAll(async () => {
   process.env.USAGE_DB = ":memory:";
   process.env.SYNC_DB = ":memory:";
   process.env.JOBS_DB = dbPath;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.VOYAGE_API_KEY;
 
   ({ app } = await import("../src/server.js"));
 });
@@ -104,8 +106,8 @@ describe("a worker booting onto an existing job database", () => {
     };
     // It has no model credential in this environment, so it will fail — but it
     // was tried again, which is the property under test.
-    expect(["queued", "running", "failed"]).toContain(body.status);
-    expect(body.attempts).toBeGreaterThanOrEqual(1);
+    expect(body.status).not.toBe("queued");
+    expect(body.attempts).toBeGreaterThan(1);
   });
 
   it("hands over a manuscript compiled by the process that died", async () => {

@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it } from "vitest";
-import { sync, type SyncLocal, type SyncRequest, type SyncResponse } from "@loom/core";
+import { sync, type SyncRequest, type SyncResponse } from "@loom/core";
 import { LoomDatabase } from "@loom/db";
 import { NodeSqliteAdapter } from "../../../packages/db/src/node-adapter.js";
 import { SyncStore } from "../src/sync-store.js";
@@ -50,7 +50,7 @@ class Device {
   }
 
   sync(store: SyncStore, account = ACCOUNT) {
-    return sync({ local: this.db as unknown as SyncLocal, transport: this.transport(store, account) });
+    return sync({ local: this.db, transport: this.transport(store, account) });
   }
 
   async texts(): Promise<string[]> {
@@ -352,7 +352,7 @@ describe("resilience", () => {
 
     const rounds: number[] = [];
     await sync({
-      local: bob.db as unknown as SyncLocal,
+      local: bob.db,
       transport: bob.transport(store),
       batchSize: 25,
       onProgress: (o) => rounds.push(o.pulled),
@@ -368,7 +368,7 @@ describe("resilience", () => {
 
     // One truncated page, then a crash before the next round.
     await sync({
-      local: bob.db as unknown as SyncLocal,
+      local: bob.db,
       transport: bob.transport(store),
       batchSize: 3,
       maxRounds: 1,

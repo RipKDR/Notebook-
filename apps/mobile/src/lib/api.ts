@@ -130,8 +130,8 @@ export async function getJob(config: ApiConfig, jobId: string): Promise<CompileJ
 export interface CompileSummary {
   readonly id: string;
   readonly status: CompileJob["status"];
-  readonly projectId: string;
-  readonly title: string;
+  readonly projectId?: string;
+  readonly title?: string;
   readonly createdAt: number;
   readonly finishedAt: number | null;
   readonly progress: CompileProgress | null;

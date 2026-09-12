@@ -30,7 +30,7 @@ export default function SettingsScreen() {
   const { settings, loading, update } = useSettings();
   const counts = useCounts();
   const indexer = useIndexer();
-  const sync = useSync({ watchAppState: false });
+  const sync = useSync();
 
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");

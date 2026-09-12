@@ -17,6 +17,7 @@ import {
   type DraftedScene,
   type PassName,
   type SyncFragment,
+  type SyncLocal,
   type SyncProject,
 } from "@loom/core";
 import type { SqlAdapter, SqlValue } from "./adapter.js";
@@ -67,7 +68,7 @@ interface EntityRow {
   kind: string;
 }
 
-export class LoomDatabase {
+export class LoomDatabase implements SyncLocal {
   constructor(private readonly db: SqlAdapter) {}
 
   /** Applies pragmas and any outstanding migrations. Safe to call on every launch. */
@@ -560,9 +561,9 @@ export class LoomDatabase {
     await this.db.transaction(async () => {
       for (const ack of acked) {
         await this.db.run(
-          `UPDATE ${entity} SET dirty = 0, synced_at = ?, remote_rev = ?
+          `UPDATE ${entity} SET dirty = 0, synced_at = ?
             WHERE id = ? AND local_rev = ?`,
-          [now, String(ack.rev), ack.id, ack.localRev],
+          [now, ack.id, ack.localRev],
         );
         // The server's revision is recorded either way, so a row that moved on
         // pushes from the right base next time rather than being rejected as
@@ -591,14 +592,20 @@ export class LoomDatabase {
   ): Promise<{ applied: number; skipped: number }> {
     let applied = 0;
     let skipped = 0;
+    if (incoming.length === 0) return { applied, skipped };
 
     await this.db.transaction(async () => {
+      const ids = [...new Set(incoming.map(({ record }) => record.id))];
+      const placeholders = ids.map(() => "?").join(", ");
+      const existingRows = await this.db.all<{ id: string; dirty: number; text: string }>(
+        `SELECT id, dirty, text FROM fragments WHERE id IN (${placeholders})`,
+        ids,
+      );
+      const existingById = new Map(existingRows.map((row) => [row.id, row]));
+
       for (const { record, rev } of incoming) {
-        const existing = await this.db.first<{ dirty: number; text: string }>(
-          `SELECT dirty, text FROM fragments WHERE id = ?`,
-          [record.id],
-        );
-        if (existing !== null && existing.dirty === 1) {
+        const existing = existingById.get(record.id);
+        if (existing !== undefined && existing.dirty === 1) {
           skipped++;
           continue;
         }
@@ -640,7 +647,7 @@ export class LoomDatabase {
         // this device already has — an echo of its own push, or a note whose
         // pinned flag moved — and discarding a perfectly good digest for that
         // means paying the model again to derive the same answer.
-        if (existing !== null && existing.text !== record.text) {
+        if (existing !== undefined && existing.text !== record.text) {
           await this.db.run(
             `UPDATE fragments
                 SET kind = NULL, digest = NULL, themes = NULL, valence = NULL,
@@ -663,14 +670,20 @@ export class LoomDatabase {
   ): Promise<{ applied: number; skipped: number }> {
     let applied = 0;
     let skipped = 0;
+    if (incoming.length === 0) return { applied, skipped };
 
     await this.db.transaction(async () => {
+      const ids = [...new Set(incoming.map(({ record }) => record.id))];
+      const placeholders = ids.map(() => "?").join(", ");
+      const existingRows = await this.db.all<{ id: string; dirty: number }>(
+        `SELECT id, dirty FROM projects WHERE id IN (${placeholders})`,
+        ids,
+      );
+      const existingById = new Map(existingRows.map((row) => [row.id, row]));
+
       for (const { record, rev } of incoming) {
-        const existing = await this.db.first<{ dirty: number }>(
-          `SELECT dirty FROM projects WHERE id = ?`,
-          [record.id],
-        );
-        if (existing !== null && existing.dirty === 1) {
+        const existing = existingById.get(record.id);
+        if (existing !== undefined && existing.dirty === 1) {
           skipped++;
           continue;
         }

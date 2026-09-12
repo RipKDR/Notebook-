@@ -26,7 +26,7 @@ note in month seven rebuilds the three scenes it affects, not a hundred thousand
 | **Draft** | ~80 scene-sized calls in parallel, sharing a cached prompt prefix. |
 | **Revise** | Transitions, continuity, voice, payoff — with the whole manuscript in one context. |
 | **Export** | EPUB, Word or Markdown, written on the device, with the network off. |
-| **Sync** | Notes and books across devices. A conflict keeps both versions, never one. |
+| **Sync** | Notebook fragments and projects across devices; compiled build artifacts stay local. A conflict keeps both versions, never one. |
 
 The design turns on one measurement: a 100k-word book is ~135k tokens against a **1M-token** window,
 so the whole thing fits seven times over — but the **128k output ceiling** means no single call can

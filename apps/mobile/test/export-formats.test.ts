@@ -47,6 +47,12 @@ describe("safeFilename", () => {
     expect(safeFilename("x".repeat(500)).length).toBe(80);
   });
 
+  it("does not split an astral character at the length boundary", () => {
+    const name = safeFilename(`${"x".repeat(79)}😀`);
+    expect(name).toBe("x".repeat(79));
+    expect(name).not.toMatch(/[\uD800-\uDFFF]/);
+  });
+
   it("never ends on a space, which some filesystems silently drop", () => {
     const name = safeFilename("word ".repeat(40));
     expect(name).toBe(name.trim());

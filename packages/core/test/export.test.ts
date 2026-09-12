@@ -298,6 +298,7 @@ describe("book assembly", () => {
     expect(stripInvalidXml("ok\uD800end")).toBe("okend");
     expect(stripInvalidXml("emoji 😀 survives")).toBe("emoji 😀 survives");
     expect(stripInvalidXml("tabs\tand\nnewlines\rstay")).toBe("tabs\tand\nnewlines\rstay");
+    expect(stripInvalidXml("next\u0085line")).toBe("next\u0085line");
   });
 
   it("escapes every character XML treats as markup", () => {
@@ -331,6 +332,20 @@ describe("EPUB", () => {
         "OEBPS/style.css",
       ]),
     );
+  });
+
+  it("preserves XML 1.0 characters from the U+007F–U+009F range in prose", () => {
+    const withNextLine = {
+      ...book,
+      manuscript: {
+        ...manuscript,
+        scenes: [scene("s1", "c1", "next\u0085line")],
+      },
+    };
+    const chapter = decode(
+      unzip(toEpub({ ...withNextLine, deflate: nodeDeflate })).get("OEBPS/text/ch0001.xhtml"),
+    );
+    expect(chapter).toContain("next\u0085line");
   });
 
   it("points the container at the package document, which exists", () => {

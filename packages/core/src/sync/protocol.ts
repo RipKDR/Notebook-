@@ -126,25 +126,40 @@ export interface SyncResponse {
  *
  * A stale base revision is not by itself a conflict: two devices that captured
  * the same note, or one that retried a push whose response was lost, produce
- * identical text. Forking a copy in that case leaves the user with duplicates of
- * their own notes and teaches them the sync is unreliable. Only the words and
- * the tombstone matter for conflict copies; metadata such as pinned/project can
- * be merged server-side without forking a duplicate note.
+ * identical content and metadata. Forking a copy in that case leaves the user
+ * with duplicates of their own notes and teaches them the sync is unreliable.
  */
 export function fragmentsDiffer(a: SyncFragment, b: SyncFragment): boolean {
-  return a.text !== b.text || (a.deletedAt === null) !== (b.deletedAt === null);
+  return (
+    a.text !== b.text ||
+    (a.deletedAt === null) !== (b.deletedAt === null) ||
+    a.projectId !== b.projectId ||
+    a.pinned !== b.pinned
+  );
 }
 
 /**
  * Picks the winner between two versions of a record.
  *
- * Last write wins on `updatedAt`, with the id as a tiebreak so that two devices
- * resolving the same tie independently reach the same answer. Without the
- * tiebreak, two phones can each decide they won and push forever.
+ * Last write wins on `updatedAt`, with a canonical payload comparison as the
+ * tiebreak so that two devices resolving the same tie independently reach the
+ * same answer. Comparing only ids cannot break a tie between versions of the
+ * same record.
  */
 export function laterOf<T extends { id: string; updatedAt: number }>(a: T, b: T): T {
   if (a.updatedAt !== b.updatedAt) return a.updatedAt > b.updatedAt ? a : b;
-  return a.id >= b.id ? a : b;
+  return canonicalJson(a) >= canonicalJson(b) ? a : b;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.entries(value)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /** The marker a conflict copy carries, so the user can see why they have two. */

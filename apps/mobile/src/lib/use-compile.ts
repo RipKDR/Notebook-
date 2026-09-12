@@ -50,6 +50,7 @@ export function useCompile(project: Project | null) {
   const [status, setStatus] = useState<CompileStatus>({ phase: "idle" });
   const abortRef = useRef<AbortController | null>(null);
   const jobRef = useRef<{ config: ApiConfig; jobId: string } | null>(null);
+  const attached = useRef<string | null>(null);
 
   const cancel = useCallback(async () => {
     abortRef.current?.abort();
@@ -121,6 +122,7 @@ export function useCompile(project: Project | null) {
 
     const config: ApiConfig = { baseUrl: settings.baseUrl, token: settings.token };
     const controller = new AbortController();
+    let startedJob: { config: ApiConfig; jobId: string } | null = null;
     abortRef.current = controller;
     setStatus({ phase: "starting" });
 
@@ -147,6 +149,8 @@ export function useCompile(project: Project | null) {
         previousState,
       });
 
+      startedJob = { config, jobId };
+      jobRef.current = startedJob;
       await watch(config, jobId, controller);
     } catch (err: unknown) {
       if (controller.signal.aborted) {
@@ -158,8 +162,8 @@ export function useCompile(project: Project | null) {
         error: err instanceof Error ? err.message : "Something went wrong.",
       });
     } finally {
-      jobRef.current = null;
-      abortRef.current = null;
+      if (startedJob !== null && jobRef.current === startedJob) jobRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
     }
   }, [db, project, settings, touch, watch]);
 
@@ -176,9 +180,13 @@ export function useCompile(project: Project | null) {
 
     const config: ApiConfig = { baseUrl: settings.baseUrl, token: settings.token };
     const controller = new AbortController();
+    let resumedJob: { config: ApiConfig; jobId: string } | null = null;
+    let didAttach = false;
 
     try {
       const { jobs } = await listCompiles(config);
+      // A compile may have been started while the discovery request was in flight.
+      if (jobRef.current !== null || abortRef.current !== null) return false;
       const inflight = jobs.find(
         (j) =>
           j.projectId === (project.id as string) &&
@@ -187,23 +195,33 @@ export function useCompile(project: Project | null) {
       if (inflight === undefined) return false;
 
       abortRef.current = controller;
-      jobRef.current = { config, jobId: inflight.id };
+      resumedJob = { config, jobId: inflight.id };
+      jobRef.current = resumedJob;
+      didAttach = true;
       setStatus({ phase: "running", progress: inflight.progress, jobId: inflight.id });
 
       await watch(config, inflight.id, controller);
       return true;
-    } catch {
+    } catch (err: unknown) {
       // A worker that is unreachable at launch is not an error worth showing:
       // the user has not asked for anything yet.
-      return false;
+      if (!didAttach) return false;
+      if (controller.signal.aborted) {
+        setStatus({ phase: "idle" });
+      } else {
+        setStatus({
+          phase: "failed",
+          error: err instanceof Error ? err.message : "Something went wrong.",
+        });
+      }
+      return true;
     } finally {
-      jobRef.current = null;
-      abortRef.current = null;
+      if (jobRef.current === resumedJob) jobRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
     }
   }, [project, settings, watch]);
 
   // Attach once per project, and only when nothing else is already happening.
-  const attached = useRef<string | null>(null);
   useEffect(() => {
     if (project === null) return;
     const key = project.id as string;

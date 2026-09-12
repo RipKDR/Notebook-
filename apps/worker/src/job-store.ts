@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { CompileProgress, CompileState } from "@loom/core";
+import type { CompileProgress, CompileState, WorkForm } from "@loom/core";
 import type { Entitlement } from "./entitlements.js";
 
 /**
@@ -26,7 +26,7 @@ export type JobStatus = "queued" | "running" | "complete" | "failed" | "cancelle
 export interface PersistedRequest {
   readonly projectId: string;
   readonly title: string;
-  readonly form: "fiction" | "memoir";
+  readonly form: WorkForm;
   readonly targetWords: number;
   readonly fragments: readonly {
     id: string;
@@ -46,7 +46,7 @@ export interface PersistedJob {
   /** How many times a worker has begun running this job. Bounds restart loops. */
   readonly attempts: number;
   readonly progress: CompileProgress | null;
-  readonly request: PersistedRequest;
+  readonly request: PersistedRequest | null;
   /** The furthest stage boundary this job has reached. Null until the Bible is built. */
   readonly checkpoint: CompileState | null;
   readonly result: CompileResultRecord | null;
@@ -62,6 +62,8 @@ export interface PersistedJob {
   readonly finishedAt: number | null;
   /** Whether the usage reservation has already been settled. Guards double-release. */
   readonly settled: boolean;
+  readonly workerOwner: string | null;
+  readonly leaseExpiresAt: number | null;
 }
 
 /**
@@ -100,6 +102,8 @@ interface JobRow {
   finished_at: number | null;
   settled: number;
   settlement_claimed_at: number | null;
+  worker_owner: string | null;
+  lease_expires_at: number | null;
 }
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>(["complete", "failed", "cancelled"]);
@@ -128,7 +132,9 @@ export class JobStore {
         created_at      INTEGER NOT NULL,
         finished_at     INTEGER,
         settled         INTEGER NOT NULL DEFAULT 0,
-        settlement_claimed_at INTEGER
+        settlement_claimed_at INTEGER,
+        worker_owner    TEXT,
+        lease_expires_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS jobs_status   ON jobs(status);
       CREATE INDEX IF NOT EXISTS jobs_finished ON jobs(finished_at);
@@ -172,13 +178,19 @@ export class JobStore {
   }
 
   /**
-   * Marks a job as running and counts the attempt.
+   * Atomically claims a job for one worker and counts the attempt.
    *
    * The attempt counter is incremented here rather than on enqueue because it
    * exists to bound *restart* loops: a job that crashes the worker on every boot
    * must eventually be given up on rather than crash-looping the service.
    */
-  claimForRun(id: string, expectedAttempts: number): boolean {
+  markRunning(
+    id: string,
+    owner: string,
+    leaseExpiresAt: number,
+    expectedAttempts: number,
+  ): boolean {
+    const now = Date.now();
     const result = this.db
       .prepare(
         `UPDATE jobs
@@ -195,32 +207,50 @@ export class JobStore {
                     WHEN progress IS NOT NULL AND json_valid(progress)
                     THEN json_set(progress, '$.spentUsd', 0)
                     ELSE progress
-                  END
+                  END,
+                worker_owner = ?,
+                lease_expires_at = ?
           WHERE id = ?
             AND attempts = ?
-            AND status IN ('queued', 'running')`,
+            AND (
+              status = 'queued'
+              OR (status = 'running' AND COALESCE(lease_expires_at, 0) <= ?)
+            )`,
       )
-      .run(id, expectedAttempts);
+      .run(owner, leaseExpiresAt, id, expectedAttempts, now);
     return Number(result.changes) > 0;
   }
 
-  /** Test helper: claims from the row's current attempt count. */
-  markRunning(id: string): void {
-    const job = this.get(id);
-    if (job === null) return;
-    this.claimForRun(id, job.attempts);
+  renewLease(id: string, owner: string, leaseExpiresAt: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE jobs SET lease_expires_at = ?
+          WHERE id = ? AND status = 'running' AND worker_owner = ?`,
+      )
+      .run(leaseExpiresAt, id, owner);
+    return Number(result.changes) > 0;
   }
 
-  saveProgress(id: string, progress: CompileProgress): void {
+  saveProgress(id: string, progress: CompileProgress, owner?: string): void {
+    const ownerGuard = owner === undefined ? "" : " AND worker_owner = ?";
     this.db
-      .prepare(`UPDATE jobs SET progress = ? WHERE id = ?`)
-      .run(JSON.stringify(progress), id);
+      .prepare(`UPDATE jobs SET progress = ? WHERE id = ?${ownerGuard}`)
+      .run(
+        ...(owner === undefined
+          ? [JSON.stringify(progress), id]
+          : [JSON.stringify(progress), id, owner]),
+      );
   }
 
-  saveCheckpoint(id: string, state: CompileState): void {
+  saveCheckpoint(id: string, state: CompileState, owner?: string): void {
+    const ownerGuard = owner === undefined ? "" : " AND worker_owner = ?";
     this.db
-      .prepare(`UPDATE jobs SET checkpoint = ? WHERE id = ?`)
-      .run(JSON.stringify(state), id);
+      .prepare(`UPDATE jobs SET checkpoint = ? WHERE id = ?${ownerGuard}`)
+      .run(
+        ...(owner === undefined
+          ? [JSON.stringify(state), id]
+          : [JSON.stringify(state), id, owner]),
+      );
   }
 
   /**
@@ -229,30 +259,36 @@ export class JobStore {
    * Called when a run ends without completing, so the next attempt's budget is
    * the entitlement minus what has already been spent on this job.
    */
-  addPriorSpend(id: string, usd: number): void {
+  addPriorSpend(id: string, usd: number, owner?: string): void {
     if (usd <= 0) return;
+    const ownerGuard = owner === undefined ? "" : " AND worker_owner = ?";
     this.db
-      .prepare(`UPDATE jobs SET prior_spend_usd = prior_spend_usd + ? WHERE id = ?`)
-      .run(usd, id);
+      .prepare(`UPDATE jobs SET prior_spend_usd = prior_spend_usd + ? WHERE id = ?${ownerGuard}`)
+      .run(...(owner === undefined ? [usd, id] : [usd, id, owner]));
   }
 
   finish(
     id: string,
     status: JobStatus,
     outcome: { result?: CompileResultRecord; error?: string; finishedAt?: number } = {},
-  ): void {
-    this.db
+    owner?: string,
+  ): boolean {
+    const ownerGuard = owner === undefined ? "" : " AND status = 'running' AND worker_owner = ?";
+    const result = this.db
       .prepare(
-        `UPDATE jobs SET status = ?, result = COALESCE(?, result), error = ?, finished_at = ?
-          WHERE id = ?`,
+        `UPDATE jobs SET status = ?, result = COALESCE(?, result), error = ?, finished_at = ?,
+                         worker_owner = NULL, lease_expires_at = NULL
+          WHERE id = ?${ownerGuard}`,
       )
-      .run(
+      .run(...[
         status,
         outcome.result === undefined ? null : JSON.stringify(outcome.result),
         outcome.error ?? null,
         outcome.finishedAt ?? Date.now(),
         id,
-      );
+        ...(owner === undefined ? [] : [owner]),
+      ]);
+    return Number(result.changes) > 0;
   }
 
   /**
@@ -355,6 +391,12 @@ export class JobStore {
     if (!columns.some((c) => c.name === "settlement_claimed_at")) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN settlement_claimed_at INTEGER`);
     }
+    if (!columns.some((c) => c.name === "worker_owner")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN worker_owner TEXT`);
+    }
+    if (!columns.some((c) => c.name === "lease_expires_at")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN lease_expires_at INTEGER`);
+    }
   }
 }
 
@@ -376,7 +418,7 @@ function hydrate(row: JobRow): PersistedJob {
     status: row.status as JobStatus,
     attempts: Number(row.attempts),
     progress: parse<CompileProgress>(row.progress),
-    request: JSON.parse(row.request) as PersistedRequest,
+    request: parse<PersistedRequest>(row.request),
     checkpoint: parse<CompileState>(row.checkpoint),
     result: parse<CompileResultRecord>(row.result),
     error: row.error,
@@ -384,5 +426,7 @@ function hydrate(row: JobRow): PersistedJob {
     createdAt: Number(row.created_at),
     finishedAt: row.finished_at === null ? null : Number(row.finished_at),
     settled: Number(row.settled) === 1,
+    workerOwner: row.worker_owner,
+    leaseExpiresAt: row.lease_expires_at === null ? null : Number(row.lease_expires_at),
   };
 }

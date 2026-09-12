@@ -11,6 +11,7 @@ import {
   type Fragment,
 } from "@loom/core";
 import { Hono, type MiddlewareHandler } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { bearerFrom, verifyToken, type TokenClaims } from "./auth.js";
 import { authorise, ENTITLEMENTS } from "./entitlements.js";
@@ -33,6 +34,11 @@ import { UsageStore } from "./usage.js";
 
 const apiKey = process.env.ANTHROPIC_API_KEY;
 const tokenSecret = process.env.LOOM_TOKEN_SECRET;
+const configuredSyncRequestMaxBytes = Number(process.env.SYNC_REQUEST_MAX_BYTES ?? 64 * 1024 * 1024);
+const syncRequestMaxBytes =
+  Number.isFinite(configuredSyncRequestMaxBytes) && configuredSyncRequestMaxBytes > 0
+    ? configuredSyncRequestMaxBytes
+    : 64 * 1024 * 1024;
 
 const embeddings: EmbeddingProvider =
   process.env.VOYAGE_API_KEY !== undefined
@@ -40,6 +46,8 @@ const embeddings: EmbeddingProvider =
     : new LocalTrigramEmbeddings();
 
 const usage = UsageStore.open(process.env.USAGE_DB ?? "./loom-usage.db");
+// Job ownership is leased defensively, but deployment is still single-process:
+// the in-memory pending queue is not coordinated across shared-volume replicas.
 const jobStore = JobStore.open(process.env.JOBS_DB ?? "./loom-jobs.db");
 const syncStore = SyncStore.open(process.env.SYNC_DB ?? "./loom-sync.db");
 
@@ -52,12 +60,12 @@ const queue = new CompileQueue({
   store: jobStore,
   /**
    * Settlement is wired here rather than per request because a job resumed after
-   * a restart has no request left to carry a closure on. Spend is recorded when
-   * a book was produced; the reservation is handed back when one was not.
+   * a restart has no request left to carry a closure on. Actual spend is always
+   * recorded; the compile reservation is handed back when no book was produced.
    */
   onSettled: (account, spentUsd, produced) => {
-    if (produced) usage.recordSpend(account, spentUsd);
-    else usage.release(account);
+    usage.recordSpend(account, spentUsd);
+    if (!produced) usage.release(account);
   },
 });
 
@@ -122,6 +130,13 @@ app.use("/v1/compile/*", authenticate);
 app.use("/v1/compiles", authenticate);
 app.use("/v1/enrich", authenticate);
 app.use("/v1/sync", authenticate);
+app.use(
+  "/v1/sync",
+  bodyLimit({
+    maxSize: syncRequestMaxBytes,
+    onError: (c) => c.json({ error: "Invalid request" }, 400),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Enrichment
@@ -430,8 +445,8 @@ app.get("/v1/compiles", (c) =>
     jobs: queue.listForAccount(c.get("claims").sub, 20).map((job) => ({
       id: job.id,
       status: job.status,
-      projectId: job.request.projectId,
-      title: job.request.title,
+      projectId: job.request?.projectId,
+      title: job.request?.title,
       createdAt: job.createdAt,
       finishedAt: job.finishedAt,
       progress: job.progress,

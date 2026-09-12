@@ -6,6 +6,7 @@ process.env.LOOM_TOKEN_SECRET = generateSecret();
 process.env.USAGE_DB = ":memory:";
 process.env.JOBS_DB = ":memory:";
 process.env.SYNC_DB = ":memory:";
+process.env.SYNC_REQUEST_MAX_BYTES = "1024";
 
 let app: { fetch: (req: Request) => Promise<Response> };
 
@@ -213,6 +214,26 @@ describe("sync", () => {
       paidToken(),
     );
     expect(res.status).toBe(400);
+  });
+
+  it("rejects a declared oversized sync body before parsing it", async () => {
+    const res = await call(
+      "/v1/sync",
+      { method: "POST", body: "{}", headers: { "content-length": "1025" } },
+      paidToken(),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid request" });
+  });
+
+  it("rejects an oversized streamed sync body without content-length", async () => {
+    const res = await call(
+      "/v1/sync",
+      { method: "POST", body: JSON.stringify({ padding: "x".repeat(1200) }) },
+      paidToken(),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid request" });
   });
 
   it("reports what it is holding, and deletes it on request", async () => {

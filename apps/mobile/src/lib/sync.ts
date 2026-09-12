@@ -1,13 +1,21 @@
 import {
   SYNC_PROTOCOL_VERSION,
   sync as runSync,
-  type SyncLocal,
   type SyncOutcome,
   type SyncRequest,
   type SyncResponse,
 } from "@loom/core";
 import type { LoomDatabase } from "@loom/db";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useDatabase } from "@/db/provider";
 import { ApiError, type ApiConfig } from "./api";
 import { isConfigured, useSettings } from "./settings";
@@ -41,7 +49,7 @@ export class SyncDisabledError extends Error {
 
 /** Posts one round trip. The engine decides how many rounds there are. */
 export function transportFor(config: ApiConfig) {
-  return async (request: SyncRequest): Promise<SyncResponse> => {
+  return async (request: SyncRequest, signal?: AbortSignal): Promise<SyncResponse> => {
     const response = await fetch(`${config.baseUrl}/v1/sync`, {
       method: "POST",
       headers: {
@@ -49,6 +57,7 @@ export function transportFor(config: ApiConfig) {
         ...(config.token !== undefined ? { authorization: `Bearer ${config.token}` } : {}),
       },
       body: JSON.stringify(request),
+      ...(signal !== undefined ? { signal } : {}),
     });
 
     if (response.status === 402) {
@@ -81,7 +90,7 @@ export async function syncNow(
   opts: { signal?: AbortSignal } = {},
 ): Promise<SyncOutcome> {
   return runSync({
-    local: db as unknown as SyncLocal,
+    local: db,
     transport: transportFor(config),
     ...(opts.signal ? { signal: opts.signal } : {}),
   });
@@ -97,11 +106,20 @@ export async function syncNow(
  * app opens is indistinguishable from one that syncs constantly, except in
  * battery and in how often a flaky connection can manufacture a conflict.
  */
-export function useSync(opts: { watchAppState?: boolean } = {}) {
+interface SyncController {
+  readonly status: SyncPhase;
+  readonly sync: () => Promise<SyncOutcome | null>;
+}
+
+const SyncContext = createContext<SyncController | null>(null);
+
+/** Owns the one synchronization lane for a database and its foreground listener. */
+export function SyncProvider({ children }: { children: ReactNode }): ReactNode {
   const { db, touch } = useDatabase();
   const { settings } = useSettings();
   const [status, setStatus] = useState<SyncPhase>({ phase: "idle" });
   const running = useRef(false);
+  const runRef = useRef<() => Promise<SyncOutcome | null>>(async () => null);
 
   const run = useCallback(async (): Promise<SyncOutcome | null> => {
     if (running.current) return null;
@@ -135,11 +153,19 @@ export function useSync(opts: { watchAppState?: boolean } = {}) {
     }
   }, [db, settings, touch]);
 
+  runRef.current = run;
+
   useEffect(() => {
     return bindAppStateSync(() => {
-      void run();
-    }, opts.watchAppState !== false);
-  }, [opts.watchAppState, run]);
+      void runRef.current();
+    }, true);
+  }, []);
 
-  return { status, sync: run };
+  return createElement(SyncContext.Provider, { value: { status, sync: run } }, children);
+}
+
+export function useSync(): SyncController {
+  const controller = useContext(SyncContext);
+  if (controller === null) throw new Error("useSync must be used inside a SyncProvider");
+  return controller;
 }

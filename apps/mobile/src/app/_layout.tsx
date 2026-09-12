@@ -7,6 +7,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { DatabaseProvider } from "@/db/provider";
 import { SettingsProvider } from "@/lib/settings-provider";
+import { SyncProvider } from "@/lib/sync";
 import { BackgroundIndexer } from "@/components/BackgroundIndexer";
 import { BackgroundSync } from "@/components/BackgroundSync";
 import { darkPalette, lightPalette } from "@/theme";
@@ -40,29 +41,31 @@ export default function RootLayout() {
         <ThemeProvider value={navigationTheme}>
           <DatabaseProvider>
             <SettingsProvider>
-              <BackgroundIndexer />
-              <BackgroundSync />
-              <StatusBar style={isDark ? "light" : "dark"} />
-              <Stack
-                screenOptions={{
-                  headerStyle: { backgroundColor: palette.bg },
-                  headerTintColor: palette.ink,
-                  headerShadowVisible: false,
-                  contentStyle: { backgroundColor: palette.bg },
-                }}
-              >
-                <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-                <Stack.Screen
-                  name="fragment/[id]"
-                  options={{ title: "Note", presentation: "card" }}
-                />
-                <Stack.Screen name="project/[id]" options={{ title: "" }} />
-                <Stack.Screen
-                  name="project/new"
-                  options={{ title: "New book", presentation: "modal" }}
-                />
-                <Stack.Screen name="settings" options={{ title: "Settings" }} />
-              </Stack>
+              <SyncProvider>
+                <BackgroundIndexer />
+                <BackgroundSync />
+                <StatusBar style={isDark ? "light" : "dark"} />
+                <Stack
+                  screenOptions={{
+                    headerStyle: { backgroundColor: palette.bg },
+                    headerTintColor: palette.ink,
+                    headerShadowVisible: false,
+                    contentStyle: { backgroundColor: palette.bg },
+                  }}
+                >
+                  <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                  <Stack.Screen
+                    name="fragment/[id]"
+                    options={{ title: "Note", presentation: "card" }}
+                  />
+                  <Stack.Screen name="project/[id]" options={{ title: "" }} />
+                  <Stack.Screen
+                    name="project/new"
+                    options={{ title: "New book", presentation: "modal" }}
+                  />
+                  <Stack.Screen name="settings" options={{ title: "Settings" }} />
+                </Stack>
+              </SyncProvider>
             </SettingsProvider>
           </DatabaseProvider>
         </ThemeProvider>

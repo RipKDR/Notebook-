@@ -57,11 +57,11 @@ export async function exportProject(
   const state = await db.loadCompileState(project.id);
   const scenes = await db.loadScenes(project.id);
 
-  const bible = state?.bible as Bible | null | undefined;
-  const outline = state?.outline as Outline | null | undefined;
-  if (bible === null || bible === undefined || outline === null || outline === undefined) {
+  if (!isBible(state?.bible) || !isOutline(state?.outline)) {
     throw new NothingToExportError();
   }
+  const bible = state.bible;
+  const outline = state.outline;
   if (scenes.length === 0) throw new NothingToExportError();
 
   const manuscript: Manuscript = {
@@ -91,6 +91,39 @@ export async function exportProject(
   file.write(data);
 
   return { uri: file.uri, filename, bytes: data.length };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Compile artifacts are persisted as JSON, so validate the fields export reads before trusting them. */
+function isBible(value: unknown): value is Bible {
+  return (
+    isRecord(value) &&
+    typeof value.version === "number" &&
+    Number.isFinite(value.version) &&
+    typeof value.title === "string" &&
+    typeof value.logline === "string"
+  );
+}
+
+function isOutline(value: unknown): value is Outline {
+  return (
+    isRecord(value) &&
+    typeof value.version === "number" &&
+    Number.isFinite(value.version) &&
+    Array.isArray(value.chapters) &&
+    value.chapters.every(
+      (chapter) =>
+        isRecord(chapter) &&
+        typeof chapter.id === "string" &&
+        typeof chapter.title === "string" &&
+        typeof chapter.part === "string" &&
+        Array.isArray(chapter.scenes) &&
+        chapter.scenes.every((scene) => isRecord(scene) && typeof scene.id === "string"),
+    )
+  );
 }
 
 /** Renders the book and hands it to the system share sheet. */

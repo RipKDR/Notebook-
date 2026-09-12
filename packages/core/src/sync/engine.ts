@@ -64,7 +64,7 @@ export interface LocalProject {
 }
 
 /** One round trip to the server. Implemented over `fetch` in the app. */
-export type SyncTransport = (request: SyncRequest) => Promise<SyncResponse>;
+export type SyncTransport = (request: SyncRequest, signal?: AbortSignal) => Promise<SyncResponse>;
 
 export interface SyncOutcome {
   readonly pushed: number;
@@ -151,19 +151,22 @@ export async function syncOnce(opts: SyncOptions): Promise<SyncOutcome> {
   for (const d of dirtyFragments) localRevs.set(d.fragment.id, d.localRev);
   for (const d of dirtyProjects) localRevs.set(d.project.id, d.localRev);
 
-  const response = await transport({
-    protocol: SYNC_PROTOCOL_VERSION,
-    since: state.cursor === 0 ? null : state.cursor,
-    fragments: dirtyFragments.map((d) => ({
-      record: toSyncFragment(d.fragment),
-      baseRev: d.baseRev,
-    })),
-    projects: dirtyProjects.map((d) => ({
-      record: toSyncProject(d.project),
-      baseRev: d.baseRev,
-    })),
-    limit: batchSize,
-  });
+  const response = await transport(
+    {
+      protocol: SYNC_PROTOCOL_VERSION,
+      since: state.cursor === 0 ? null : state.cursor,
+      fragments: dirtyFragments.map((d) => ({
+        record: toSyncFragment(d.fragment),
+        baseRev: d.baseRev,
+      })),
+      projects: dirtyProjects.map((d) => ({
+        record: toSyncProject(d.project),
+        baseRev: d.baseRev,
+      })),
+      limit: batchSize,
+    },
+    opts.signal,
+  );
 
   // 1. Record what the server accepted, so those rows stop being pushed.
   const ackFragments = dirtyFragments

@@ -162,7 +162,7 @@ describe("conflicts", () => {
     store.close();
   });
 
-  it("keeps current metadata when a stale retry disagrees on both metadata fields", () => {
+  it("deterministically applies the later metadata when both metadata fields differ", () => {
     const store = SyncStore.open();
     send(store, { fragments: [push(fragment("f1", "same words"))] });
     send(store, {
@@ -173,10 +173,10 @@ describe("conflicts", () => {
       fragments: [push({ ...fragment("f1", "same words", 2500), pinned: true }, 1)],
     });
     expect(stale.conflicts.fragments).toHaveLength(0);
-    expect(stale.accepted.f1).toBe(2);
+    expect(stale.accepted.f1).toBe(3);
     const latest = send(store, { since: 0 }).fragments.at(-1)!;
-    expect(latest.record.projectId).toBe("p1");
-    expect(latest.record.pinned).toBe(false);
+    expect(latest.record.projectId).toBeNull();
+    expect(latest.record.pinned).toBe(true);
     store.close();
   });
 
@@ -345,15 +345,21 @@ describe("the cursor", () => {
 
   it("includes a project when the same request pushes over one page of assigned fragments", () => {
     const store = SyncStore.open();
-    const result = send(store, {
+    const first = send(store, {
       limit: 500,
       projects: [push(project("p1", "A book"))],
       fragments: Array.from({ length: 501 }, (_, i) =>
         push({ ...fragment(`f${i}`, `note ${i}`), projectId: "p1" }),
       ),
     });
-    expect(result.projects.map((p) => p.record.id)).toEqual(["p1"]);
-    expect(result.fragments.length).toBeGreaterThan(0);
+    expect(first.projects.map((p) => p.record.id)).toEqual(["p1"]);
+    expect(first.fragments.every((f) => f.record.projectId === "p1")).toBe(true);
+    expect(first.hasMore).toBe(true);
+
+    const second = send(store, { since: first.cursor, limit: 500 });
+    const delivered = [...first.fragments, ...second.fragments];
+    expect(new Set(delivered.map((f) => f.record.id)).size).toBe(501);
+    expect(second.hasMore).toBe(false);
     store.close();
   });
 });

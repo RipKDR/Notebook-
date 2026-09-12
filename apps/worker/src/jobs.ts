@@ -91,6 +91,8 @@ export interface QueueOptions {
    * budget on each pass.
    */
   readonly maxAttempts?: number;
+  /** Claim lease duration. Renewed while this process owns the compile. */
+  readonly leaseMs?: number;
   /**
    * Model clients, injectable for testing, mirroring the same seam on
    * `compile()`. A factory rather than an instance because each job gets its own
@@ -116,12 +118,15 @@ export class CompileQueue {
   private readonly concurrency: number;
   private readonly retentionMs: number;
   private readonly maxAttempts: number;
+  private readonly leaseMs: number;
+  private readonly owner = newId();
   private readonly embeddings: EmbeddingProvider;
 
   constructor(private readonly opts: QueueOptions = {}) {
     this.concurrency = opts.concurrency ?? 2;
     this.retentionMs = opts.retentionMs ?? 6 * 60 * 60 * 1000;
     this.maxAttempts = opts.maxAttempts ?? 3;
+    this.leaseMs = opts.leaseMs ?? 60_000;
     this.store = opts.store ?? JobStore.open(":memory:");
     this.embeddings =
       opts.voyageApiKey !== undefined
@@ -165,7 +170,7 @@ export class CompileQueue {
         job.account,
         job.status === "complete"
           ? job.priorSpendUsd + (job.result?.costUsd ?? 0)
-          : 0,
+          : job.priorSpendUsd,
         job.status === "complete",
       );
     }
@@ -208,6 +213,7 @@ export class CompileQueue {
       controller.abort();
       return true;
     }
+    if (job.status === "running") return false;
 
     // Still queued: drop it before it ever starts.
     const index = this.pending.indexOf(id);
@@ -241,25 +247,51 @@ export class CompileQueue {
     if (job === null) return;
     if (isTerminal(job.status)) return;
 
-    if (!this.store.claimForRun(id, job.attempts)) return;
+    if (!this.store.markRunning(id, this.owner, Date.now() + this.leaseMs, job.attempts)) return;
     const claimed = this.store.get(id);
     if (claimed === null) return;
 
+    if (claimed.request === null) {
+      this.settle(
+        id,
+        "failed",
+        { error: "The persisted compile request is unreadable and cannot be resumed." },
+        this.owner,
+      );
+      return;
+    }
+    const request = claimed.request;
+
     const controller = new AbortController();
     this.live.set(id, controller);
+    const heartbeat = setInterval(() => {
+      try {
+        if (!this.store.renewLease(id, this.owner, Date.now() + this.leaseMs)) controller.abort();
+      } catch {
+        controller.abort();
+      }
+    }, Math.max(1_000, Math.floor(this.leaseMs / 2)));
+    heartbeat.unref?.();
+    const releaseLive = () => {
+      clearInterval(heartbeat);
+      this.live.delete(id);
+    };
 
     // Resume from the furthest stage boundary this job reached, falling back to
     // whatever the client uploaded. Resumption is not a special path in the
     // compiler: a checkpoint is a `CompileState`, so the incremental build
     // reuses the Bible, the outline and every drafted scene by content key.
-    const previous = claimed.checkpoint ?? claimed.request.previousState;
-    const budgetUsd = claimed.request.entitlement.budgetUsd - claimed.priorSpendUsd;
+    const previous = claimed.checkpoint ?? request.previousState;
+    const budgetUsd = request.entitlement.budgetUsd - claimed.priorSpendUsd;
 
     if (budgetUsd <= 0) {
-      this.live.delete(id);
-      this.settle(id, "failed", {
-        error: "This compile has already spent its budget across earlier attempts.",
-      });
+      releaseLive();
+      this.settle(
+        id,
+        "failed",
+        { error: "This compile has already spent its budget across earlier attempts." },
+        this.owner,
+      );
       return;
     }
 
@@ -271,19 +303,19 @@ export class CompileQueue {
     try {
       const result = await compile({
         project: {
-          id: asProjectId(claimed.request.projectId),
-          title: claimed.request.title,
-          form: claimed.request.form,
-          targetWords: claimed.request.targetWords,
+          id: asProjectId(request.projectId),
+          title: request.title,
+          form: request.form,
+          targetWords: request.targetWords,
           createdAt: claimed.createdAt,
           updatedAt: claimed.createdAt,
           archivedAt: null,
         },
-        fragments: claimed.request.fragments.map(toFragment),
+        fragments: request.fragments.map(toFragment),
         previous: previous ?? emptyCompileState,
         embeddings: this.embeddings,
         budgetUsd,
-        skipRevision: !claimed.request.entitlement.revision,
+        skipRevision: !request.entitlement.revision,
         ...(this.opts.apiKey !== undefined ? { apiKey: this.opts.apiKey } : {}),
         ...(this.opts.models !== undefined ? this.opts.models() : {}),
         signal: controller.signal,
@@ -291,39 +323,49 @@ export class CompileQueue {
           progressSpent = next.spentUsd;
           spent = Math.max(progressSpent, usageSpent);
           latestProgress = { ...next, spentUsd: spent };
-          this.store.saveProgress(id, latestProgress);
+          this.store.saveProgress(id, latestProgress, this.owner);
         },
         onUsage: (event: { costUsd: number }) => {
           usageSpent += event.costUsd;
           spent = Math.max(progressSpent, usageSpent);
           if (latestProgress !== null) {
-            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent }, this.owner);
           }
         },
         onCheckpoint: (state: CompileState) => {
           progressSpent = spent;
           if (latestProgress !== null) {
-            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent }, this.owner);
           }
-          this.store.saveCheckpoint(id, state);
+          this.store.saveCheckpoint(id, state, this.owner);
         },
       });
 
       spent = result.costUsd;
-      this.live.delete(id);
-      this.settle(id, "complete", { result: toRecord(result), spentUsd: claimed.priorSpendUsd + spent });
+      releaseLive();
+      this.settle(
+        id,
+        "complete",
+        { result: toRecord(result), spentUsd: claimed.priorSpendUsd + spent },
+        this.owner,
+      );
     } catch (err: unknown) {
-      this.live.delete(id);
+      releaseLive();
       const cancelled = controller.signal.aborted;
 
       // Bank what this attempt spent so a resumed run cannot exceed the
       // entitlement's ceiling by starting a fresh budget each time.
-      this.store.addPriorSpend(id, spent);
+      this.store.addPriorSpend(id, spent, this.owner);
 
-      this.settle(id, cancelled ? "cancelled" : "failed", {
-        error: err instanceof Error ? err.message : String(err),
-        spentUsd: claimed.priorSpendUsd + spent,
-      });
+      this.settle(
+        id,
+        cancelled ? "cancelled" : "failed",
+        {
+          error: err instanceof Error ? err.message : String(err),
+          spentUsd: claimed.priorSpendUsd + spent,
+        },
+        this.owner,
+      );
     }
   }
 
@@ -338,14 +380,21 @@ export class CompileQueue {
     id: string,
     status: JobStatus,
     outcome: { result?: CompileResultRecord; error?: string; spentUsd?: number },
+    owner?: string,
   ): void {
     const job = this.store.get(id);
     if (job === null) return;
 
-    this.store.finish(id, status, {
-      ...(outcome.result !== undefined ? { result: outcome.result } : {}),
-      ...(outcome.error !== undefined ? { error: outcome.error } : {}),
-    });
+    const finished = this.store.finish(
+      id,
+      status,
+      {
+        ...(outcome.result !== undefined ? { result: outcome.result } : {}),
+        ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+      },
+      owner,
+    );
+    if (!finished) return;
 
     this.finalizeSettlement(id, job.account, outcome.spentUsd ?? 0, status === "complete");
   }

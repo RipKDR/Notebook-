@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CompileQueue } from "../src/jobs.js";
 import { JobStore } from "../src/job-store.js";
 import { ENTITLEMENTS } from "../src/entitlements.js";
@@ -44,6 +44,9 @@ const request = {
   entitlement: ENTITLEMENTS.paid,
   account: "acct-1",
 };
+
+const markCrashed = (store: JobStore, id: string): boolean =>
+  store.markRunning(id, "crashed-test-worker", 0, store.get(id)?.attempts ?? -1);
 
 /** A queue wired to the fake model, so a compile actually runs without a credential. */
 function fakeQueue(opts: Partial<ConstructorParameters<typeof CompileQueue>[0]> = {}) {
@@ -177,13 +180,19 @@ describe("CompileQueue", () => {
   it("fails a job cleanly when there is no model credential", async () => {
     // No `models` seam and no API key: the compile must reject onto the job
     // rather than becoming an unhandled rejection that takes the worker down.
-    const queue = new CompileQueue({ concurrency: 1 });
-    const job = queue.enqueue(request);
-    await settled(queue, job.id);
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("VOYAGE_API_KEY", "");
+    try {
+      const queue = new CompileQueue({ concurrency: 1 });
+      const job = queue.enqueue(request);
+      await settled(queue, job.id);
 
-    expect(queue.get(job.id)?.status).toBe("failed");
-    expect(queue.get(job.id)?.error).toBeTruthy();
-    queue.close();
+      expect(queue.get(job.id)?.status).toBe("failed");
+      expect(queue.get(job.id)?.error).toBeTruthy();
+      queue.close();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   }, 40_000);
 });
 
@@ -221,7 +230,7 @@ describe("surviving a restart", () => {
       createdAt: Date.now(),
       request: { ...request, previousState: null },
     });
-    store.markRunning(crashed.id);
+    markCrashed(store, crashed.id);
     store.saveCheckpoint(crashed.id, checkpoint);
 
     const { queue: rebooted, seen } = fakeQueue({ store });
@@ -243,7 +252,7 @@ describe("surviving a restart", () => {
       createdAt: Date.now(),
       request,
     });
-    store.markRunning(crashed.id);
+    markCrashed(store, crashed.id);
 
     const { queue, seen } = fakeQueue({ store });
     expect(queue.recover().resumed).toBe(1);
@@ -268,6 +277,24 @@ describe("surviving a restart", () => {
     store.close();
   }, 40_000);
 
+  it("fails an unreadable persisted request without breaking recovery", async () => {
+    const store = JobStore.open();
+    store.create({ id: "corrupt-request", account: "acct-1", createdAt: Date.now(), request });
+    (store as unknown as { db: { exec: (sql: string) => void } }).db.exec(
+      `UPDATE jobs SET request = '{not json' WHERE id = 'corrupt-request'`,
+    );
+
+    const { queue } = fakeQueue({ store });
+    expect(queue.recover().resumed).toBe(1);
+    await settled(queue, "corrupt-request");
+
+    expect(queue.get("corrupt-request")).toMatchObject({
+      status: "failed",
+      error: expect.stringMatching(/request.*unreadable/i),
+    });
+    store.close();
+  });
+
   it("gives up on a job that has already burned its attempts, and releases the quota", () => {
     const store = JobStore.open();
     const released: { account: string; produced: boolean }[] = [];
@@ -277,9 +304,9 @@ describe("surviving a restart", () => {
       createdAt: Date.now(),
       request,
     });
-    store.markRunning(job.id);
-    store.markRunning(job.id);
-    store.markRunning(job.id);
+    markCrashed(store, job.id);
+    markCrashed(store, job.id);
+    markCrashed(store, job.id);
 
     const { queue } = fakeQueue({
       store,
@@ -316,7 +343,7 @@ describe("surviving a restart", () => {
       // Paid tier's ceiling, all of it already spent on the attempt that died.
       request,
     });
-    store.markRunning(job.id);
+    markCrashed(store, job.id);
     store.addPriorSpend(job.id, ENTITLEMENTS.paid.budgetUsd);
 
     const { queue } = fakeQueue({ store });

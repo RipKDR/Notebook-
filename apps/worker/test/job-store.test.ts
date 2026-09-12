@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { JobStore, isTerminal, type PersistedRequest } from "../src/job-store.js";
 import { ENTITLEMENTS } from "../src/entitlements.js";
 
@@ -15,6 +18,22 @@ const request: PersistedRequest = {
 const seed = (store: JobStore, id: string, account = "acct-1") =>
   store.create({ id, account, request, createdAt: Date.now() });
 
+const markCrashed = (store: JobStore, id: string): boolean =>
+  store.markRunning(id, "crashed-test-worker", 0, store.get(id)?.attempts ?? -1);
+
+let tempDir: string;
+let dbPath: string;
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), "loom-job-store-"));
+  dbPath = join(tempDir, "jobs.db");
+});
+
+afterEach(() => {
+  // Removing the directory also removes SQLite's -wal and -shm sidecars.
+  rmSync(tempDir, { recursive: true, force: true });
+});
+
 describe("JobStore", () => {
   it("round-trips a job through SQLite", () => {
     const store = JobStore.open();
@@ -25,8 +44,8 @@ describe("JobStore", () => {
     expect(created.settled).toBe(false);
 
     const read = store.get("j1");
-    expect(read?.request.title).toBe("The Kitchen Radio");
-    expect(read?.request.fragments[0]?.text).toBe("She never once said my name.");
+    expect(read?.request?.title).toBe("The Kitchen Radio");
+    expect(read?.request?.fragments[0]?.text).toBe("She never once said my name.");
     store.close();
   });
 
@@ -39,8 +58,8 @@ describe("JobStore", () => {
   it("counts an attempt each time a job starts running", () => {
     const store = JobStore.open();
     seed(store, "j1");
-    store.markRunning("j1");
-    store.markRunning("j1");
+    markCrashed(store, "j1");
+    markCrashed(store, "j1");
     expect(store.get("j1")?.attempts).toBe(2);
     expect(store.get("j1")?.status).toBe("running");
     store.close();
@@ -49,9 +68,23 @@ describe("JobStore", () => {
   it("claims a run only from the expected attempt count", () => {
     const store = JobStore.open();
     seed(store, "j1");
-    expect(store.claimForRun("j1", 0)).toBe(true);
-    expect(store.claimForRun("j1", 0)).toBe(false);
+    const lease = Date.now() + 60_000;
+    expect(store.markRunning("j1", "worker-a", lease, 0)).toBe(true);
+    expect(store.markRunning("j1", "worker-b", lease, 0)).toBe(false);
     expect(store.get("j1")?.attempts).toBe(1);
+    expect(store.get("j1")).toMatchObject({ workerOwner: "worker-a", leaseExpiresAt: lease });
+    store.close();
+  });
+
+  it("allows only the lease owner to complete a claimed job", () => {
+    const store = JobStore.open();
+    seed(store, "j1");
+    expect(store.markRunning("j1", "worker-a", Date.now() + 60_000, 0)).toBe(true);
+
+    expect(store.finish("j1", "complete", {}, "worker-b")).toBe(false);
+    expect(store.get("j1")?.status).toBe("running");
+    expect(store.finish("j1", "complete", {}, "worker-a")).toBe(true);
+    expect(store.get("j1")?.status).toBe("complete");
     store.close();
   });
 
@@ -100,7 +133,7 @@ describe("JobStore", () => {
       detail: "Writing",
       spentUsd: 1.75,
     });
-    expect(store.claimForRun("j1", 0)).toBe(true);
+    expect(store.markRunning("j1", "worker-a", Date.now() + 60_000, 0)).toBe(true);
     const read = store.get("j1");
     expect(read?.priorSpendUsd).toBeCloseTo(1.75);
     expect(read?.progress?.spentUsd).toBe(0);
@@ -123,7 +156,7 @@ describe("JobStore", () => {
     seed(store, "queued-one");
     seed(store, "running-one");
     seed(store, "done-one");
-    store.markRunning("running-one");
+    markCrashed(store, "running-one");
     store.finish("done-one", "complete");
 
     expect(store.interrupted().map((j) => j.id).sort()).toEqual(["queued-one", "running-one"]);
@@ -131,8 +164,7 @@ describe("JobStore", () => {
   });
 
   it("keeps a finished result readable after the process that made it is gone", () => {
-    const path = `${process.env.TMPDIR ?? "/tmp"}/loom-jobs-test-${Date.now()}.db`;
-    const first = JobStore.open(path);
+    const first = JobStore.open(dbPath);
     seed(first, "j1");
     first.finish("j1", "complete", {
       result: {
@@ -152,7 +184,7 @@ describe("JobStore", () => {
     first.close();
 
     // A different process, the same disk.
-    const second = JobStore.open(path);
+    const second = JobStore.open(dbPath);
     const job = second.get("j1");
     expect(job?.status).toBe("complete");
     expect(job?.result?.manuscript.scenes).toHaveLength(1);
@@ -165,7 +197,7 @@ describe("JobStore", () => {
     seed(store, "old");
     seed(store, "recent");
     seed(store, "still-running");
-    store.markRunning("still-running");
+    markCrashed(store, "still-running");
     store.finish("old", "complete", { finishedAt: 1_000 });
     store.finish("recent", "complete", { finishedAt: Date.now() });
 
@@ -198,6 +230,19 @@ describe("JobStore", () => {
     const job = store.get("j1");
     expect(job?.status).toBe("complete");
     expect(job?.result).toBeNull();
+    store.close();
+  });
+
+  it("survives an unreadable request blob in get and listings", () => {
+    const store = JobStore.open();
+    seed(store, "j1");
+    (store as unknown as { db: { exec: (sql: string) => void } }).db.exec(
+      `UPDATE jobs SET request = '{not json' WHERE id = 'j1'`,
+    );
+
+    expect(store.get("j1")?.request).toBeNull();
+    expect(store.listForAccount("acct-1")[0]?.request).toBeNull();
+    expect(store.interrupted()[0]?.request).toBeNull();
     store.close();
   });
 
