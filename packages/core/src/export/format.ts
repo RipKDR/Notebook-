@@ -1,3 +1,4 @@
+import { assembleBook, type Book } from "./book.js";
 import type { Bible } from "../types/bible.js";
 import type { Manuscript } from "../types/manuscript.js";
 import type { Outline } from "../types/outline.js";
@@ -23,45 +24,8 @@ export interface ExportOptions {
 }
 
 export function toMarkdown(opts: ExportOptions): string {
-  const {
-    bible,
-    outline,
-    manuscript,
-    chapterHeadings = true,
-    sceneBreak = "* * *",
-    includeFrontMatter = true,
-  } = opts;
-
-  const byScene = new Map(manuscript.scenes.map((s) => [s.sceneId as string, s]));
-  const out: string[] = [];
-
-  if (includeFrontMatter) {
-    out.push(`---`, `title: ${JSON.stringify(bible.title)}`, `---`, "", `# ${bible.title}`, "");
-    if (bible.logline.trim().length > 0) out.push(`*${bible.logline}*`, "");
-  }
-
-  let lastPart = "";
-  for (const chapter of outline.chapters) {
-    const scenes = chapter.scenes
-      .map((card) => byScene.get(card.id as string))
-      .filter((s): s is NonNullable<typeof s> => s !== undefined && s.prose.trim().length > 0);
-    if (scenes.length === 0) continue;
-
-    if (chapter.part !== lastPart && chapter.part.trim().length > 0) {
-      out.push(`# ${chapter.part}`, "");
-      lastPart = chapter.part;
-    }
-    if (chapterHeadings) {
-      out.push(`## ${chapter.index + 1}. ${chapter.title}`, "");
-    }
-
-    scenes.forEach((scene, i) => {
-      if (i > 0 && sceneBreak.length > 0) out.push(sceneBreak, "");
-      out.push(scene.prose.trim(), "");
-    });
-  }
-
-  return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+  const { chapterHeadings = true, sceneBreak = "* * *", includeFrontMatter = true } = opts;
+  return markdownFromBook(assembleBook(opts), { chapterHeadings, sceneBreak, includeFrontMatter });
 }
 
 export function toPlainText(opts: ExportOptions): string {
@@ -70,6 +34,28 @@ export function toPlainText(opts: ExportOptions): string {
     .replace(/^\*\s\*\s\*$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function markdownFromBook(
+  book: Book,
+  opts: { chapterHeadings: boolean; sceneBreak: string; includeFrontMatter: boolean },
+): string {
+  const out: string[] = [];
+  if (opts.includeFrontMatter) {
+    out.push(`---`, `title: ${JSON.stringify(book.title)}`, `---`, "", `# ${book.title}`, "");
+    if (book.logline.trim().length > 0) out.push(`*${book.logline}*`, "");
+  }
+
+  for (const chapter of book.chapters) {
+    if (chapter.opensPart !== null) out.push(`# ${chapter.opensPart}`, "");
+    if (opts.chapterHeadings) out.push(`## ${chapter.number}. ${chapter.title}`, "");
+    chapter.scenes.forEach((scene, i) => {
+      if (i > 0 && opts.sceneBreak.length > 0) out.push(opts.sceneBreak, "");
+      out.push(scene.paragraphs.join("\n\n"), "");
+    });
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
 }
 
 /** At 250 words per minute, the conventional figure for adult prose reading. */

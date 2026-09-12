@@ -99,6 +99,7 @@ interface JobRow {
   created_at: number;
   finished_at: number | null;
   settled: number;
+  settlement_claimed_at: number | null;
 }
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>(["complete", "failed", "cancelled"]);
@@ -126,12 +127,14 @@ export class JobStore {
         prior_spend_usd REAL NOT NULL DEFAULT 0,
         created_at      INTEGER NOT NULL,
         finished_at     INTEGER,
-        settled         INTEGER NOT NULL DEFAULT 0
+        settled         INTEGER NOT NULL DEFAULT 0,
+        settlement_claimed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS jobs_status   ON jobs(status);
       CREATE INDEX IF NOT EXISTS jobs_finished ON jobs(finished_at);
       CREATE INDEX IF NOT EXISTS jobs_account  ON jobs(account, created_at DESC);
     `);
+    this.ensureColumns();
   }
 
   static open(path: string = ":memory:"): JobStore {
@@ -175,10 +178,37 @@ export class JobStore {
    * exists to bound *restart* loops: a job that crashes the worker on every boot
    * must eventually be given up on rather than crash-looping the service.
    */
+  claimForRun(id: string, expectedAttempts: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE jobs
+            SET status = 'running',
+                attempts = attempts + 1,
+                prior_spend_usd = prior_spend_usd +
+                  CASE
+                    WHEN progress IS NOT NULL AND json_valid(progress)
+                    THEN COALESCE(CAST(json_extract(progress, '$.spentUsd') AS REAL), 0)
+                    ELSE 0
+                  END,
+                progress =
+                  CASE
+                    WHEN progress IS NOT NULL AND json_valid(progress)
+                    THEN json_set(progress, '$.spentUsd', 0)
+                    ELSE progress
+                  END
+          WHERE id = ?
+            AND attempts = ?
+            AND status IN ('queued', 'running')`,
+      )
+      .run(id, expectedAttempts);
+    return Number(result.changes) > 0;
+  }
+
+  /** Test helper: claims from the row's current attempt count. */
   markRunning(id: string): void {
-    this.db
-      .prepare(`UPDATE jobs SET status = 'running', attempts = attempts + 1 WHERE id = ?`)
-      .run(id);
+    const job = this.get(id);
+    if (job === null) return;
+    this.claimForRun(id, job.attempts);
   }
 
   saveProgress(id: string, progress: CompileProgress): void {
@@ -232,11 +262,57 @@ export class JobStore {
    * hand back a second compile, and a cancelled-then-recovered job must not
    * release the same reservation twice.
    */
-  claimSettlement(id: string): boolean {
+  claimSettlement(id: string): number | null {
+    const token = Date.now() * 1000 + Math.floor(Math.random() * 1000);
     const result = this.db
-      .prepare(`UPDATE jobs SET settled = 1 WHERE id = ? AND settled = 0`)
-      .run(id);
-    return Number(result.changes) > 0;
+      .prepare(
+        `UPDATE jobs
+            SET settlement_claimed_at = ?
+          WHERE id = ?
+            AND settled = 0
+            AND settlement_claimed_at IS NULL`,
+      )
+      .run(token, id);
+    return Number(result.changes) > 0 ? token : null;
+  }
+
+  completeSettlement(id: string, token: number): void {
+    this.db
+      .prepare(
+        `UPDATE jobs
+            SET settled = 1, settlement_claimed_at = NULL
+          WHERE id = ? AND settled = 0 AND settlement_claimed_at = ?`,
+      )
+      .run(id, token);
+  }
+
+  releaseSettlementClaim(id: string, token: number): void {
+    this.db
+      .prepare(
+        `UPDATE jobs
+            SET settlement_claimed_at = NULL
+          WHERE id = ? AND settled = 0 AND settlement_claimed_at = ?`,
+      )
+      .run(id, token);
+  }
+
+  clearSettlementClaimsOnRecovery(): void {
+    this.db
+      .prepare(
+        `UPDATE jobs
+            SET settlement_claimed_at = NULL
+          WHERE settled = 0 AND status IN ('complete', 'failed', 'cancelled')`,
+      )
+      .run();
+  }
+
+  unsettledTerminal(): readonly PersistedJob[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM jobs WHERE settled = 0 AND status IN ('complete', 'failed', 'cancelled')`,
+      )
+      .all() as unknown as JobRow[];
+    return rows.map(hydrate);
   }
 
   /** Jobs that were queued or in flight when the process stopped, oldest first. */
@@ -272,6 +348,13 @@ export class JobStore {
 
   close(): void {
     this.db.close();
+  }
+
+  private ensureColumns(): void {
+    const columns = this.db.prepare(`PRAGMA table_info(jobs)`).all() as { name: string }[];
+    if (!columns.some((c) => c.name === "settlement_claimed_at")) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN settlement_claimed_at INTEGER`);
+    }
   }
 }
 

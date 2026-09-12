@@ -155,6 +155,21 @@ export class CompileQueue {
     let resumed = 0;
     let abandoned = 0;
 
+    // A process can die after claiming settlement and before touching usage.
+    // Those claims have no owner after a reboot, so recovery drops and reclaims
+    // them before accepting traffic.
+    this.store.clearSettlementClaimsOnRecovery();
+    for (const job of this.store.unsettledTerminal()) {
+      this.finalizeSettlement(
+        job.id,
+        job.account,
+        job.status === "complete"
+          ? job.priorSpendUsd + (job.result?.costUsd ?? 0)
+          : 0,
+        job.status === "complete",
+      );
+    }
+
     for (const job of this.store.interrupted()) {
       if (job.attempts >= this.maxAttempts) {
         this.settle(job.id, "failed", {
@@ -226,6 +241,10 @@ export class CompileQueue {
     if (job === null) return;
     if (isTerminal(job.status)) return;
 
+    if (!this.store.claimForRun(id, job.attempts)) return;
+    const claimed = this.store.get(id);
+    if (claimed === null) return;
+
     const controller = new AbortController();
     this.live.set(id, controller);
 
@@ -233,8 +252,8 @@ export class CompileQueue {
     // whatever the client uploaded. Resumption is not a special path in the
     // compiler: a checkpoint is a `CompileState`, so the incremental build
     // reuses the Bible, the outline and every drafted scene by content key.
-    const previous = job.checkpoint ?? job.request.previousState;
-    const budgetUsd = job.request.entitlement.budgetUsd - job.priorSpendUsd;
+    const previous = claimed.checkpoint ?? claimed.request.previousState;
+    const budgetUsd = claimed.request.entitlement.budgetUsd - claimed.priorSpendUsd;
 
     if (budgetUsd <= 0) {
       this.live.delete(id);
@@ -244,40 +263,55 @@ export class CompileQueue {
       return;
     }
 
-    this.store.markRunning(id);
-    let spent = 0;
+    let progressSpent = claimed.progress?.spentUsd ?? 0;
+    let usageSpent = claimed.progress?.spentUsd ?? 0;
+    let latestProgress = claimed.progress;
+    let spent = Math.max(progressSpent, usageSpent);
 
     try {
       const result = await compile({
         project: {
-          id: asProjectId(job.request.projectId),
-          title: job.request.title,
-          form: job.request.form,
-          targetWords: job.request.targetWords,
-          createdAt: job.createdAt,
-          updatedAt: job.createdAt,
+          id: asProjectId(claimed.request.projectId),
+          title: claimed.request.title,
+          form: claimed.request.form,
+          targetWords: claimed.request.targetWords,
+          createdAt: claimed.createdAt,
+          updatedAt: claimed.createdAt,
           archivedAt: null,
         },
-        fragments: job.request.fragments.map(toFragment),
+        fragments: claimed.request.fragments.map(toFragment),
         previous: previous ?? emptyCompileState,
         embeddings: this.embeddings,
         budgetUsd,
-        skipRevision: !job.request.entitlement.revision,
+        skipRevision: !claimed.request.entitlement.revision,
         ...(this.opts.apiKey !== undefined ? { apiKey: this.opts.apiKey } : {}),
         ...(this.opts.models !== undefined ? this.opts.models() : {}),
         signal: controller.signal,
-        onProgress: (progress: CompileProgress) => {
-          spent = progress.spentUsd;
-          this.store.saveProgress(id, progress);
+        onProgress: (next: CompileProgress) => {
+          progressSpent = next.spentUsd;
+          spent = Math.max(progressSpent, usageSpent);
+          latestProgress = { ...next, spentUsd: spent };
+          this.store.saveProgress(id, latestProgress);
+        },
+        onUsage: (event: { costUsd: number }) => {
+          usageSpent += event.costUsd;
+          spent = Math.max(progressSpent, usageSpent);
+          if (latestProgress !== null) {
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+          }
         },
         onCheckpoint: (state: CompileState) => {
+          progressSpent = spent;
+          if (latestProgress !== null) {
+            this.store.saveProgress(id, { ...latestProgress, spentUsd: spent });
+          }
           this.store.saveCheckpoint(id, state);
         },
       });
 
       spent = result.costUsd;
       this.live.delete(id);
-      this.settle(id, "complete", { result: toRecord(result), spentUsd: job.priorSpendUsd + spent });
+      this.settle(id, "complete", { result: toRecord(result), spentUsd: claimed.priorSpendUsd + spent });
     } catch (err: unknown) {
       this.live.delete(id);
       const cancelled = controller.signal.aborted;
@@ -288,7 +322,7 @@ export class CompileQueue {
 
       this.settle(id, cancelled ? "cancelled" : "failed", {
         error: err instanceof Error ? err.message : String(err),
-        spentUsd: job.priorSpendUsd + spent,
+        spentUsd: claimed.priorSpendUsd + spent,
       });
     }
   }
@@ -313,8 +347,17 @@ export class CompileQueue {
       ...(outcome.error !== undefined ? { error: outcome.error } : {}),
     });
 
-    if (this.store.claimSettlement(id)) {
-      this.opts.onSettled?.(job.account, outcome.spentUsd ?? 0, status === "complete");
+    this.finalizeSettlement(id, job.account, outcome.spentUsd ?? 0, status === "complete");
+  }
+
+  private finalizeSettlement(id: string, account: string, spentUsd: number, produced: boolean): void {
+    const claim = this.store.claimSettlement(id);
+    if (claim === null) return;
+    try {
+      this.opts.onSettled?.(account, spentUsd, produced);
+      this.store.completeSettlement(id, claim);
+    } catch {
+      this.store.releaseSettlementClaim(id, claim);
     }
   }
 

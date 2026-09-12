@@ -113,17 +113,17 @@ export class SyncStore {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const fragmentResult = this.applyPushes(
-        account,
-        "sync_fragments",
-        request.fragments,
-        fragmentsDiffer,
-      );
       const projectResult = this.applyPushes(
         account,
         "sync_projects",
         request.projects,
         projectsDiffer,
+      );
+      const fragmentResult = this.applyPushes(
+        account,
+        "sync_fragments",
+        request.fragments,
+        fragmentsDiffer,
       );
 
       // Read back after writing, so a client's own pushes are inside the page it
@@ -268,7 +268,20 @@ export class SyncStore {
         // Same words. A retried push, or two devices that captured the same
         // note. Forking a copy here would leave the user with duplicates of
         // their own writing and teach them the sync is unreliable.
-        accepted[push.record.id] = rev;
+        if (table === "sync_fragments") {
+          const merged = mergeFragmentMetadata(current as SyncFragment, push.record as SyncFragment);
+          if (
+            merged.projectId !== (current as SyncFragment).projectId ||
+            merged.pinned !== (current as SyncFragment).pinned
+          ) {
+            this.write(account, table, merged as T, rev + 1);
+            accepted[push.record.id] = rev + 1;
+          } else {
+            accepted[push.record.id] = rev;
+          }
+        } else {
+          accepted[push.record.id] = rev;
+        }
         continue;
       }
 
@@ -280,6 +293,21 @@ export class SyncStore {
         rejected: push.record,
         current: { record: current, rev, seq: Number(existing.seq) },
       });
+    }
+
+    function mergeFragmentMetadata(current: SyncFragment, pushed: SyncFragment): SyncFragment {
+      if (pushed.updatedAt <= current.updatedAt) return current;
+      if (current.projectId !== pushed.projectId && current.pinned !== pushed.pinned) return current;
+      const projectId =
+        current.projectId === pushed.projectId ? current.projectId : pushed.projectId;
+      const pinned = current.pinned === pushed.pinned ? current.pinned : pushed.pinned;
+      if (projectId === current.projectId && pinned === current.pinned) return current;
+      return {
+        ...current,
+        projectId,
+        pinned,
+        updatedAt: Math.max(current.updatedAt, pushed.updatedAt),
+      };
     }
 
     return { accepted, conflicts };

@@ -329,4 +329,37 @@ describe("surviving a restart", () => {
     expect(queue.get(job.id)?.error).toMatch(/budget/i);
     store.close();
   }, 40_000);
+
+  it("reconciles a terminal unsettled job on reboot", () => {
+    const store = JobStore.open();
+    const settledCalls: { account: string; spent: number; produced: boolean }[] = [];
+    const job = store.create({ id: "settle-me", account: "acct-1", createdAt: Date.now(), request });
+    store.addPriorSpend(job.id, 1.25);
+    store.finish(job.id, "complete", {
+      result: {
+        compileId: "c1",
+        state: { bible: null, outline: null, manuscript: null, ledger: null, compiledAt: 1 },
+        manuscript: { scenes: [{ prose: "x" }] },
+        coverage: 1,
+        reusedScenes: 0,
+        rebuiltScenes: 1,
+        continuityIssues: [],
+        continuityAssessment: "ok",
+        unusedFragments: [],
+        costUsd: 2.5,
+        words: 1,
+      },
+    });
+    // Simulate a crash after claiming settlement and before touching usage.
+    expect(store.claimSettlement(job.id)).not.toBeNull();
+
+    const { queue } = fakeQueue({
+      store,
+      onSettled: (account, spent, produced) => settledCalls.push({ account, spent, produced }),
+    });
+    expect(queue.recover()).toEqual({ resumed: 0, abandoned: 0 });
+    expect(settledCalls).toEqual([{ account: "acct-1", spent: 3.75, produced: true }]);
+    expect(store.get(job.id)?.settled).toBe(true);
+    store.close();
+  });
 });

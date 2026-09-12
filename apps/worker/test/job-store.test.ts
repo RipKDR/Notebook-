@@ -46,6 +46,15 @@ describe("JobStore", () => {
     store.close();
   });
 
+  it("claims a run only from the expected attempt count", () => {
+    const store = JobStore.open();
+    seed(store, "j1");
+    expect(store.claimForRun("j1", 0)).toBe(true);
+    expect(store.claimForRun("j1", 0)).toBe(false);
+    expect(store.get("j1")?.attempts).toBe(1);
+    store.close();
+  });
+
   it("persists progress and checkpoints so a restart can read them back", () => {
     const store = JobStore.open();
     seed(store, "j1");
@@ -82,11 +91,29 @@ describe("JobStore", () => {
     store.close();
   });
 
+  it("banks persisted attempt spend when a run is claimed", () => {
+    const store = JobStore.open();
+    seed(store, "j1");
+    store.saveProgress("j1", {
+      status: "drafting",
+      fraction: 0.4,
+      detail: "Writing",
+      spentUsd: 1.75,
+    });
+    expect(store.claimForRun("j1", 0)).toBe(true);
+    const read = store.get("j1");
+    expect(read?.priorSpendUsd).toBeCloseTo(1.75);
+    expect(read?.progress?.spentUsd).toBe(0);
+    store.close();
+  });
+
   it("settles exactly once", () => {
     const store = JobStore.open();
     seed(store, "j1");
-    expect(store.claimSettlement("j1")).toBe(true);
-    expect(store.claimSettlement("j1")).toBe(false);
+    const claim = store.claimSettlement("j1");
+    expect(claim).not.toBeNull();
+    expect(store.claimSettlement("j1")).toBeNull();
+    store.completeSettlement("j1", claim!);
     expect(store.get("j1")?.settled).toBe(true);
     store.close();
   });

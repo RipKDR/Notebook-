@@ -8,10 +8,10 @@ import {
 } from "@loom/core";
 import type { LoomDatabase } from "@loom/db";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AppState } from "react-native";
 import { useDatabase } from "@/db/provider";
 import { ApiError, type ApiConfig } from "./api";
 import { isConfigured, useSettings } from "./settings";
+import { bindAppStateSync } from "./sync-app-state";
 
 /**
  * Cloud sync, from the app's side.
@@ -97,7 +97,7 @@ export async function syncNow(
  * app opens is indistinguishable from one that syncs constantly, except in
  * battery and in how often a flaky connection can manufacture a conflict.
  */
-export function useSync() {
+export function useSync(opts: { watchAppState?: boolean } = {}) {
   const { db, touch } = useDatabase();
   const { settings } = useSettings();
   const [status, setStatus] = useState<SyncPhase>({ phase: "idle" });
@@ -136,13 +136,10 @@ export function useSync() {
   }, [db, settings, touch]);
 
   useEffect(() => {
-    if (AppState.currentState === "active") void run();
-
-    const subscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") void run();
-    });
-    return () => subscription.remove();
-  }, [run]);
+    return bindAppStateSync(() => {
+      void run();
+    }, opts.watchAppState !== false);
+  }, [opts.watchAppState, run]);
 
   return { status, sync: run };
 }

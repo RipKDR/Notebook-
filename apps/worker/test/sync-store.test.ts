@@ -144,6 +144,42 @@ describe("conflicts", () => {
     store.close();
   });
 
+  it("merges stale metadata-only fragment updates without forking a conflict copy", () => {
+    const store = SyncStore.open();
+    send(store, { fragments: [push(fragment("f1", "same words"))] });
+    // Move the revision forward without changing metadata.
+    send(store, { fragments: [push(fragment("f1", "same words", 2000), 1)] });
+
+    const stale = send(store, {
+      fragments: [push({ ...fragment("f1", "same words", 2500), pinned: true }, 1)],
+    });
+    expect(stale.conflicts.fragments).toHaveLength(0);
+    expect(stale.accepted.f1).toBe(3);
+
+    const latest = send(store, { since: 0 }).fragments.at(-1)!;
+    expect(latest.record.projectId).toBeNull();
+    expect(latest.record.pinned).toBe(true);
+    store.close();
+  });
+
+  it("keeps current metadata when a stale retry disagrees on both metadata fields", () => {
+    const store = SyncStore.open();
+    send(store, { fragments: [push(fragment("f1", "same words"))] });
+    send(store, {
+      fragments: [push({ ...fragment("f1", "same words", 2000), projectId: "p1" }, 1)],
+    });
+
+    const stale = send(store, {
+      fragments: [push({ ...fragment("f1", "same words", 2500), pinned: true }, 1)],
+    });
+    expect(stale.conflicts.fragments).toHaveLength(0);
+    expect(stale.accepted.f1).toBe(2);
+    const latest = send(store, { since: 0 }).fragments.at(-1)!;
+    expect(latest.record.projectId).toBe("p1");
+    expect(latest.record.pinned).toBe(false);
+    store.close();
+  });
+
   it("treats a differing tombstone as a conflict", () => {
     // One device deleted a note while another kept writing in it. That is a
     // decision only the user can make, so both survive.
@@ -304,6 +340,20 @@ describe("the cursor", () => {
   it("clamps an oversized page request", () => {
     const store = SyncStore.open();
     expect(() => send(store, { limit: 10_000 })).not.toThrow();
+    store.close();
+  });
+
+  it("includes a project when the same request pushes over one page of assigned fragments", () => {
+    const store = SyncStore.open();
+    const result = send(store, {
+      limit: 500,
+      projects: [push(project("p1", "A book"))],
+      fragments: Array.from({ length: 501 }, (_, i) =>
+        push({ ...fragment(`f${i}`, `note ${i}`), projectId: "p1" }),
+      ),
+    });
+    expect(result.projects.map((p) => p.record.id)).toEqual(["p1"]);
+    expect(result.fragments.length).toBeGreaterThan(0);
     store.close();
   });
 });

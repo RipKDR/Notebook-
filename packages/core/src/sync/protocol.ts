@@ -128,8 +128,8 @@ export interface SyncResponse {
  * the same note, or one that retried a push whose response was lost, produce
  * identical text. Forking a copy in that case leaves the user with duplicates of
  * their own notes and teaches them the sync is unreliable. Only the words and
- * the tombstone matter — a pinned flag or a project assignment is not worth
- * duplicating a note over.
+ * the tombstone matter for conflict copies; metadata such as pinned/project can
+ * be merged server-side without forking a duplicate note.
  */
 export function fragmentsDiffer(a: SyncFragment, b: SyncFragment): boolean {
   return a.text !== b.text || (a.deletedAt === null) !== (b.deletedAt === null);
